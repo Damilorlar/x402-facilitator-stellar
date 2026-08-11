@@ -18,6 +18,11 @@
 import express from 'express';
 import { resolveConfig } from './config.js';
 import { buildFacilitator } from './facilitator.js';
+import { installRpcRetry } from './rpc-retry.js';
+
+// Must run before the scheme makes any RPC call. Retries connection-level
+// failures only; see rpc-retry.js for what that deliberately excludes.
+installRpcRetry({ log: msg => console.warn(`  ${msg}`) });
 
 const config = resolveConfig();
 const { facilitator, signers } = buildFacilitator(config);
