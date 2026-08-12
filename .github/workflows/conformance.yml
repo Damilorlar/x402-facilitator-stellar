@@ -1,0 +1,147 @@
+name: Conformance (upstream x402 e2e)
+
+# Deliberately a separate workflow from ci.yml.
+#
+# This job depends on testnet, on friendbot, and on a third-party repository at
+# whatever state its main branch is in today. Any of those can be down without
+# anything being wrong with this service. Wiring it into ci.yml would mean a
+# Stellar testnet outage turns a docs PR red, and a red build that nobody
+# believes is worse than no build at all.
+on:
+  schedule:
+    # Daily. Spec drift and upstream harness changes are the thing being watched
+    # for, and neither moves faster than that.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      x402_ref:
+        description: 'Ref of x402-foundation/x402 to test against'
+        required: false
+        default: 'main'
+  # Also on branches named conformance/**, so the job can be iterated on without
+  # waiting for a nightly run or merging an untested workflow to main.
+  push:
+    branches: ['conformance/**']
+
+concurrency:
+  group: conformance
+  cancel-in-progress: false
+
+jobs:
+  upstream-e2e:
+    name: upstream e2e (stellar, testnet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the facilitator
+        uses: actions/checkout@v4
+        with:
+          path: facilitator
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install facilitator dependencies
+        working-directory: facilitator
+        run: npm ci
+
+      - name: Check out the x402 e2e suite
+        uses: actions/checkout@v4
+        with:
+          repository: x402-foundation/x402
+          ref: ${{ github.event.inputs.x402_ref || 'main' }}
+          path: x402
+
+      # Recorded so a failure can be attributed to an upstream change rather
+      # than guessed at. docs/UPSTREAM.md holds the last reviewed SHA.
+      - name: Record the upstream revision under test
+        id: upstream
+        working-directory: x402
+        run: |
+          SHA=$(git rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Testing against x402-foundation/x402 @ $SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install the e2e harness
+        working-directory: x402/e2e
+        run: pnpm install --frozen-lockfile
+
+      # The upstream directory is gitignored, which is the documented place for
+      # a facilitator whose implementation does not live in that repository.
+      - name: Install our facilitator as an external proxy
+        run: |
+          mkdir -p x402/e2e/facilitators/external-proxies/accensa
+          cp facilitator/e2e/accensa-proxy/run.sh \
+             facilitator/e2e/accensa-proxy/test.config.json \
+             x402/e2e/facilitators/external-proxies/accensa/
+          chmod +x x402/e2e/facilitators/external-proxies/accensa/run.sh
+
+      # Fresh accounts per run rather than repository secrets. Three funded
+      # testnet keys stored in CI configuration forever, rotated by nobody, is a
+      # worse arrangement than generating them for the ninety seconds they are
+      # needed. There is deliberately no pubnet path here.
+      - name: Generate and fund testnet accounts
+        working-directory: facilitator
+        run: node scripts/fund-testnet-accounts.mjs --github-env
+
+      - name: Write the harness environment
+        working-directory: x402/e2e
+        run: |
+          {
+            echo "CLIENT_STELLAR_PRIVATE_KEY=$CLIENT_STELLAR_PRIVATE_KEY"
+            echo "SERVER_STELLAR_ADDRESS=$SERVER_STELLAR_ADDRESS"
+            echo "FACILITATOR_STELLAR_PRIVATE_KEY=$FACILITATOR_STELLAR_PRIVATE_KEY"
+            echo "FACILITATOR_SECRET=$FACILITATOR_SECRET"
+            echo "ACCENSA_FACILITATOR_DIR=$GITHUB_WORKSPACE/facilitator"
+          } > .env
+          # Prove the file was written without printing key material.
+          echo "wrote $(wc -l < .env) variables"
+
+      - name: Run the upstream suite against this facilitator
+        id: run
+        working-directory: x402/e2e
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          pnpm test --testnet --families=stellar --min -v 2>&1 | tee ../../conformance-output.txt
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Upstream conformance run"
+            echo
+            echo "- upstream: \`x402-foundation/x402@${{ steps.upstream.outputs.sha }}\`"
+            echo "- facilitator: \`${{ github.sha }}\`"
+            echo "- family: stellar · network: testnet · scheme: exact"
+            echo "- result: **${{ steps.run.outcome }}**"
+            echo
+            echo '```'
+            tail -60 conformance-output.txt 2>/dev/null || echo "(no output captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the full output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-output
+          path: conformance-output.txt
+          if-no-files-found: warn
+          retention-days: 90
+
+      # Failing loudly is the point. A conformance job that is allowed to go
+      # quietly amber is the same as not running it — but the failure lands
+      # here, after the artifact is published, so a failed run is still
+      # diagnosable rather than just red.
+      - name: Fail if the suite failed
+        if: steps.run.outcome == 'failure'
+        run: |
+          echo "::error::The upstream e2e suite did not pass. See the conformance-output artifact."
+          exit 1
