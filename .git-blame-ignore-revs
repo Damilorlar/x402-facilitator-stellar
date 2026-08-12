@@ -1,0 +1,5 @@
+# Revisions to skip when running git blame. Configure once with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# style: apply prettier across the tree
+e9c5cbc59b367d368fa3f58c5dc3557354c9c9ac
