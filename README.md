@@ -107,6 +107,8 @@ stellar keys generate facilitator --network testnet --fund
 
 ### Run locally
 
+**Option A: Node.js**
+
 ```bash
 # 1. Install
 npm install
@@ -117,6 +119,15 @@ export FACILITATOR_SECRET=$(stellar keys show facilitator)
 
 # 3. Serve
 npm start
+```
+
+**Option B: Docker Compose**
+
+For a production-like setup including the database (see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details):
+
+```bash
+export FACILITATOR_SECRET=$(stellar keys show facilitator)
+docker compose up
 ```
 
 ```bash
@@ -144,12 +155,10 @@ curl -s localhost:3402/supported | jq
 |---|---|---|
 | `FACILITATOR_SECRET` | *required* | `S…` secret for the testnet signer |
 | `PORT` | `3402` | |
-| `STELLAR_RPC_URL` | package default | Public testnet RPC is fine |
-| `STELLAR_RPC_URL_PUBNET` | *required if enabled* | A provider URL is required for pubnet |
-| `MAX_TX_FEE_STROOPS` | `50000` | Fee ceiling per settlement on testnet. Configurable, never hard-wired |
-| `MAX_TX_FEE_STROOPS_PUBNET` | `50000` | Fee ceiling per settlement on pubnet |
-| `FACILITATOR_API_KEYS` | *(unset)* | Comma-separated. Unset means open, which is correct for a free testnet instance and is logged at boot |
-| `ENABLE_PUBNET` | `false` | Requires `FACILITATOR_SECRET_PUBNET` and `STELLAR_RPC_URL_PUBNET`; refuses to start without them |
+| `STELLAR_RPC_URL` | package default | Public testnet RPC is fine; a provider URL is wanted for pubnet |
+| `MAX_TX_FEE_STROOPS` | `50000` | Fee ceiling per settlement. Configurable, never hard-wired |
+| `FACILITATOR_API_KEYS` | *(unset)* | Comma-separated. See [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md). Unset means open. |
+| `ENABLE_PUBNET` | `false` | Requires `FACILITATOR_SECRET_PUBNET`; refuses to start without it |
 
 Pubnet is opt-in behind its own secret deliberately: running a mainnet facilitator from a
 testnet-shaped config loses real money.

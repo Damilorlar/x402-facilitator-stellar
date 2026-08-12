@@ -15,6 +15,7 @@
  *     ones, so an agent can branch on a code instead of parsing prose;
  *   - responses are passed through from the scheme untouched.
  */
+import crypto from 'node:crypto';
 import express from 'express';
 import { resolveConfig } from './config.js';
 import { buildFacilitator } from './facilitator.js';
@@ -39,11 +40,35 @@ app.use(express.json({ limit: '256kb' }));
  */
 function requireApiKey(req, res, next) {
   if (config.apiKeys.length === 0) return next();
-  const presented = req.get('authorization')?.replace(/^Bearer /i, '');
-  if (!presented || !config.apiKeys.includes(presented)) {
-    return res.status(401).json({ error: 'unauthorized', reason: 'invalid_api_key' });
+  
+  const authHeader = req.get('authorization');
+  if (!authHeader) {
+    return res.status(401).json({ error: 'unauthorized', reason: 'missing_auth_header' });
   }
-  next();
+
+  let presentedKey = '';
+  if (authHeader.startsWith('Bearer ')) {
+    presentedKey = authHeader.substring(7);
+  } else if (!authHeader.includes(' ')) {
+    presentedKey = authHeader;
+  } else {
+    return res.status(401).json({ error: 'unauthorized', reason: 'malformed_auth_header' });
+  }
+
+  if (!presentedKey || presentedKey.includes(' ')) {
+    return res.status(401).json({ error: 'unauthorized', reason: 'malformed_auth_header' });
+  }
+
+  const presentedHash = crypto.createHash('sha256').update(presentedKey).digest();
+
+  for (const apiKey of config.apiKeys) {
+    if (presentedHash.length === apiKey.hash.length && crypto.timingSafeEqual(presentedHash, apiKey.hash)) {
+      req.keyId = apiKey.id;
+      return next();
+    }
+  }
+
+  return res.status(401).json({ error: 'unauthorized', reason: 'invalid_api_key' });
 }
 
 /**
