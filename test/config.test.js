@@ -42,11 +42,11 @@ test('resolveConfig: pubnet sets per-network values correctly', () => {
   };
   const config = resolveConfig(env);
   assert.deepStrictEqual(config.networks, [TESTNET, PUBNET]);
-  
+
   assert.strictEqual(config.perNetwork[TESTNET].secret, 'S123');
   assert.strictEqual(config.perNetwork[TESTNET].rpcUrl, 'https://testnet.local');
   assert.strictEqual(config.perNetwork[TESTNET].maxTransactionFeeStroops, 10000);
-  
+
   assert.strictEqual(config.perNetwork[PUBNET].secret, 'S456');
   assert.strictEqual(config.perNetwork[PUBNET].rpcUrl, 'https://pubnet.local');
   assert.strictEqual(config.perNetwork[PUBNET].maxTransactionFeeStroops, 20000);

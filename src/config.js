@@ -60,13 +60,19 @@ export function resolveConfig(env = process.env) {
     }
     return {
       id,
-      hash: crypto.createHash('sha256').update(secretPart).digest()
+      hash: crypto.createHash('sha256').update(secretPart).digest(),
     };
   });
 
   // Parse Rate Limits
-  const parseLimits = (str) => {
-    const limits = { verifyRpm: 60, settleRpm: 10, settleRph: 100, settleRpd: 1000, feeSpd: 5000000 };
+  const parseLimits = str => {
+    const limits = {
+      verifyRpm: 60,
+      settleRpm: 10,
+      settleRph: 100,
+      settleRpd: 1000,
+      feeSpd: 5000000,
+    };
     if (!str) return limits;
     str.split(',').forEach(pair => {
       const [k, v] = pair.split('=');
@@ -81,7 +87,7 @@ export function resolveConfig(env = process.env) {
 
   const rateLimits = {
     global: parseLimits(env.RATE_LIMIT_GLOBAL),
-    keys: {}
+    keys: {},
   };
 
   for (const k of Object.keys(env)) {

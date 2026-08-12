@@ -10,9 +10,9 @@ test('auth config resolution handles open mode', () => {
 });
 
 test('auth config resolves plain keys to hashes with auto-generated ids', () => {
-  const env = { 
+  const env = {
     FACILITATOR_SECRET: Keypair.random().secret(),
-    FACILITATOR_API_KEYS: 'secret1, secret2'
+    FACILITATOR_API_KEYS: 'secret1, secret2',
   };
   const config = resolveConfig(env);
   assert.equal(config.apiKeys.length, 2);
@@ -22,9 +22,9 @@ test('auth config resolves plain keys to hashes with auto-generated ids', () => 
 });
 
 test('auth config resolves named keys', () => {
-  const env = { 
+  const env = {
     FACILITATOR_SECRET: Keypair.random().secret(),
-    FACILITATOR_API_KEYS: 'admin:supersecret,agent:agentsecret'
+    FACILITATOR_API_KEYS: 'admin:supersecret,agent:agentsecret',
   };
   const config = resolveConfig(env);
   assert.equal(config.apiKeys.length, 2);

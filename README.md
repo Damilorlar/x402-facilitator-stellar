@@ -2,6 +2,7 @@
   <h1>x402-facilitator-stellar</h1>
   <p><strong>An x402 facilitator for Stellar — verify, settle, supported</strong></p>
   <p>
+    <img src="https://img.shields.io/github/actions/workflow/status/accensa/x402-facilitator-stellar/ci.yml?branch=main" alt="CI Status" />
     <img src="https://img.shields.io/badge/status-conformance%20spike-orange.svg" alt="Status: conformance spike" />
     <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License Apache 2.0" />
     <img src="https://img.shields.io/badge/stellar-testnet-success.svg" alt="Stellar testnet" />
@@ -62,113 +63,36 @@ gives you `x402Facilitator` with `verify()`, `settle()` and `getSupported()`, an
 surface is yours to write. That surface, plus configuration, caller authentication and
 operational concerns, is what lives here.
 
-## Architecture
+## Documentation
 
-```mermaid
-flowchart LR
-    A[Buyer agent] -->|1. request| RS[Resource server]
-    RS -->|2. 402 + terms| A
-    A -->|3. PaymentPayload| RS
-    RS -->|4. POST /verify, /settle| F
+Please refer to our [Documentation Hub](docs/README.md) for detailed role-based guides:
+- [Seller Guide](docs/SELLER.md)
+- [Buyer / Agent Guide](docs/BUYER.md)
+- [Operator Guide](docs/OPERATOR.md)
 
-    subgraph F[" this repo "]
-        HTTP["/verify · /settle · /supported"]
-        SCHEME["ExactStellarScheme<br/>@x402/stellar"]
-        HTTP --> SCHEME
-    end
-
-    SCHEME -->|5. submit auth entry| SOR[(Stellar / Soroban)]
-    SCHEME -.->|fee sponsored by facilitator| SOR
-```
-
-| Route | Purpose |
-|---|---|
-| `GET /supported` | Supported kinds, extensions and signers — including the Stellar `extra` block with `areFeesSponsored` |
-| `POST /verify` | `{paymentPayload, paymentRequirements}` → `VerifyResponse` |
-| `POST /settle` | `{paymentPayload, paymentRequirements}` → `SettleResponse` |
-| `GET /healthz` | Liveness |
-
-## Getting Started
-
-### Prerequisites
-
-- Node.js ≥ 20
-- [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools) for key management
-
-### Three distinct accounts are required
-
-`ExactStellarScheme` rejects any payment where the facilitator is a party to the transfer.
-Payer, recipient and facilitator must therefore be three different accounts — reusing the
-merchant key as the facilitator key fails verification on the very first request.
+### Tests
 
 ```bash
-stellar keys generate facilitator --network testnet --fund
+npm test              # unit tests — no network, no funded account, no .env
+npm run lint          # eslint
+npm run format:check  # prettier, check only
+npm run licenses      # fails on any AGPL in the dependency path
 ```
 
-### Run locally
+All four run in CI on every push and pull request, across Node 20 and 22.
 
-**Option A: Node.js**
+The end-to-end conformance run is separate, because it needs testnet and two
+funded accounts:
 
 ```bash
-# 1. Install
-npm install
-
-# 2. Configure
-cp .env.example .env
-export FACILITATOR_SECRET=$(stellar keys show facilitator)
-
-# 3. Serve
-npm start
-```
-
-**Option B: Docker Compose**
-
-For a production-like setup including the database (see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details):
-
-```bash
-export FACILITATOR_SECRET=$(stellar keys show facilitator)
-docker compose up
-```
-
-```bash
-curl -s localhost:3402/supported | jq
-```
-
-```json
-{
-  "kinds": [
-    {
-      "x402Version": 2,
-      "scheme": "exact",
-      "network": "stellar:testnet",
-      "extra": { "areFeesSponsored": true }
-    }
-  ],
-  "extensions": [],
-  "signers": { "stellar:*": ["G..."] }
-}
+FACILITATOR_SECRET=$(stellar keys show facilitator) npm start &
+ALICE_SECRET=$(stellar keys show alice) npm run e2e
 ```
 
 ### Privacy and Data Minimisation
 
 The X402 Facilitator handles sensitive transaction and search query data. Our approach is to collect only what is necessary, and to aggressively purge it according to strict retention policies.
 For detailed information, see our [Privacy Policy](docs/PRIVACY.md).
-
-## Configuration
-
-| Variable | Default | Notes |
-|---|---|---|
-| `FACILITATOR_SECRET` | *required* | `S…` secret for the testnet signer |
-| `PORT` | `3402` | |
-| `STELLAR_RPC_URL` | package default | Public testnet RPC is fine; a provider URL is wanted for pubnet |
-| `MAX_TX_FEE_STROOPS` | `50000` | Fee ceiling per settlement. Configurable, never hard-wired |
-| `FACILITATOR_API_KEYS` | *(unset)* | Comma-separated. See [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md). Unset means open. |
-| `RATE_LIMIT_GLOBAL` | *(unset)* | Global rate limit configuration. See [docs/OPERATIONS.md](docs/OPERATIONS.md). |
-| `RATE_LIMIT_<keyId>` | *(unset)* | Per-key rate limit override. |
-| `ENABLE_PUBNET` | `false` | Requires `FACILITATOR_SECRET_PUBNET`; refuses to start without it |
-
-Pubnet is opt-in behind its own secret deliberately: running a mainnet facilitator from a
-testnet-shaped config loses real money.
 
 ## Conformance
 
