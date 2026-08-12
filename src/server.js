@@ -20,6 +20,7 @@ import express from 'express';
 import { resolveConfig } from './config.js';
 import { buildFacilitator } from './facilitator.js';
 import { installRpcRetry } from './rpc-retry.js';
+import { RateLimiter } from './rate-limit.js';
 
 // Must run before the scheme makes any RPC call. Retries connection-level
 // failures only; see rpc-retry.js for what that deliberately excludes.
@@ -27,6 +28,7 @@ installRpcRetry({ log: msg => console.warn(`  ${msg}`) });
 
 const config = resolveConfig();
 const { facilitator, signers } = buildFacilitator(config);
+const rateLimiter = new RateLimiter(config.rateLimits);
 
 const app = express();
 app.use(express.json({ limit: '256kb' }));
@@ -72,6 +74,28 @@ function requireApiKey(req, res, next) {
 }
 
 /**
+ * Require API key for usage (no open mode allowed for this).
+ */
+function requireApiKeyStrict(req, res, next) {
+  if (config.apiKeys.length === 0) {
+    return res.status(401).json({ error: 'unauthorized', reason: 'open_mode_usage_forbidden' });
+  }
+  requireApiKey(req, res, next);
+}
+
+function handleRateLimit(res, checkResult) {
+  if (checkResult) {
+    res.set('RateLimit-Limit', checkResult.limit);
+    res.set('RateLimit-Remaining', checkResult.remaining);
+    res.set('RateLimit-Reset', checkResult.resetAt);
+    if (!checkResult.allowed) {
+      res.set('Retry-After', Math.max(1, checkResult.resetAt - Math.floor(Date.now() / 1000)));
+      return res.status(429).json({ error: 'rate_limited', reason: checkResult.reason });
+    }
+  }
+}
+
+/**
  * Both /verify and /settle take {paymentPayload, paymentRequirements}.
  * Returning a non-null reason on a malformed body matters as much as on a
  * failed verification — a null reason anywhere is an acceptance failure.
@@ -102,10 +126,19 @@ app.get('/supported', (_req, res) => {
   res.json(facilitator.getSupported());
 });
 
+app.get('/usage', requireApiKeyStrict, (req, res) => {
+  res.json(rateLimiter.getUsage(req.keyId));
+});
+
 app.post('/verify', requireApiKey, async (req, res) => {
+  const check = rateLimiter.checkVerify(req);
+  if (!check.allowed) return handleRateLimit(res, check);
+
   const body = readPaymentBody(req, res);
   if (!body) return;
   try {
+    rateLimiter.recordVerify(req);
+    handleRateLimit(res, check);
     const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
     res.json(result);
   } catch (err) {
@@ -127,10 +160,15 @@ app.post('/verify', requireApiKey, async (req, res) => {
 });
 
 app.post('/settle', requireApiKey, async (req, res) => {
+  const check = rateLimiter.checkSettle(req);
+  if (!check.allowed) return handleRateLimit(res, check);
+
   const body = readPaymentBody(req, res);
   if (!body) return;
   try {
     const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
+    rateLimiter.recordSettle(req, result.success ? result.transactionFeeStroops || 0 : 0);
+    handleRateLimit(res, check);
     res.json(result);
   } catch (err) {
     // SettleResponse requires `transaction` and `network` even on failure, so

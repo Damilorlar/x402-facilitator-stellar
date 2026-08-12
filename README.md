@@ -158,6 +158,8 @@ curl -s localhost:3402/supported | jq
 | `STELLAR_RPC_URL` | package default | Public testnet RPC is fine; a provider URL is wanted for pubnet |
 | `MAX_TX_FEE_STROOPS` | `50000` | Fee ceiling per settlement. Configurable, never hard-wired |
 | `FACILITATOR_API_KEYS` | *(unset)* | Comma-separated. See [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md). Unset means open. |
+| `RATE_LIMIT_GLOBAL` | *(unset)* | Global rate limit configuration. See [docs/OPERATIONS.md](docs/OPERATIONS.md). |
+| `RATE_LIMIT_<keyId>` | *(unset)* | Per-key rate limit override. |
 | `ENABLE_PUBNET` | `false` | Requires `FACILITATOR_SECRET_PUBNET`; refuses to start without it |
 
 Pubnet is opt-in behind its own secret deliberately: running a mainnet facilitator from a
@@ -190,7 +192,7 @@ correct locally and is non-conformant on the wire.
   contention. One signer is enough to prove conformance and not enough to serve load.
 - **No Bazaar.** Discovery, search and automatic cataloging are absent. This spike is only
   about the payment path.
-- **No persistence, metering, or rate limiting.**
+- **No persistence.**
 - **`exact` only.** The `upto` scheme has no Stellar specification yet; design notes in
   [`accensa-contracts/docs/ADR-002`](https://github.com/accensa/accensa-contracts/blob/main/docs/ADR-002-upto-scheme.md).
 
