@@ -68,9 +68,19 @@ jobs:
         with:
           version: 10
 
-      - name: Install the e2e harness
+      # setup.sh shells out to Go and uv for the non-TypeScript components. Go
+      # is preinstalled on the runner; uv is not.
+      - name: Install uv (needed by the harness setup for python components)
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      # `pnpm install` is NOT enough. install:all is `pnpm install && ./setup.sh`,
+      # and setup.sh is what builds the workspace @x402/* packages the spawned
+      # servers import. Without it every server dies at startup with
+      # "Cannot find module '@x402/express/dist/cjs/index.js'" — which is how the
+      # first run of this job failed.
+      - name: Install and build the e2e harness
         working-directory: x402/e2e
-        run: pnpm install --frozen-lockfile
+        run: pnpm install:all
 
       # The upstream directory is gitignored, which is the documented place for
       # a facilitator whose implementation does not live in that repository.
@@ -109,7 +119,13 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          pnpm test --testnet --families=stellar --min -v 2>&1 | tee ../../conformance-output.txt
+          # --facilitators=accensa matters. Without it the harness also starts
+          # its own reference facilitators, and a failure in one of those aborts
+          # the run before ours is ever exercised — which is what happened on the
+          # first run of this job, and is a fact about the harness rather than
+          # evidence about this service.
+          pnpm test --testnet --families=stellar --facilitators=accensa --min -v 2>&1 \
+            | tee ../../conformance-output.txt
 
       - name: Summarise
         if: always()

@@ -153,18 +153,25 @@ Run locally against `x402-foundation/x402@main`, Stellar family, testnet.
 ```
 
 **What is not yet proven, and why.** No payment completed. The run stopped
-before any scenario executed, because the upstream *servers* failed to start:
+before any scenario executed. Two causes, both in how the harness was invoked
+rather than in this service:
+
+1. `--facilitators=accensa` was omitted, so the harness also started its own
+   reference facilitator, which died on a missing `@x402/aptos` and aborted the
+   whole run before any of our scenarios executed.
+2. `pnpm install` was used instead of `pnpm install:all`, so the upstream
+   *servers* could not start either:
 
 ```
 Error: Cannot find module '/…/e2e/servers/typescript/node_modules/@x402/express/dist/cjs/index.js'
 [servers/typescript/http/express] Process exited with code 1 during startup
 ```
 
-That is the `pnpm install` vs `pnpm install:all` gap described above — an
-install-procedure problem in the environment the harness was run in, not a
-finding about this facilitator. **It is recorded here rather than omitted**,
+Both are invocation problems in the environment the harness was run in, not
+findings about this facilitator. **They are recorded here rather than omitted**,
 because a conformance document that lists only what passed is one that was not
-looked at hard enough.
+looked at hard enough — and because the next person to run this will hit exactly
+these two things.
 
 So the honest statement today is: **this facilitator is accepted by the upstream
 harness as a conforming external facilitator and passes its health gate; whether
