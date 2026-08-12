@@ -11,7 +11,26 @@ export class MemoryCatalogStore {
     const key = this._key(resource);
     const existing = this.resources.get(key);
 
+    // Limit resources per payTo to prevent catalog flooding (max 50)
+    if (!existing) {
+      let payToCount = 0;
+      for (const r of this.resources.values()) {
+        if (r.payTo === resource.payTo) payToCount++;
+      }
+      if (payToCount >= 50) {
+        throw new Error('maximum_resources_per_payto_exceeded');
+      }
+    }
+
     const now = new Date();
+    // A changed payTo on an existing listing is flagged per policy.
+    // For now, we will log a warning.
+    if (existing && existing.payTo !== resource.payTo) {
+      console.warn(
+        `[Catalog] Resource ${key} changed payTo from ${existing.payTo} to ${resource.payTo}`,
+      );
+    }
+
     const entry = {
       ...existing,
       ...resource,

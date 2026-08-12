@@ -22,6 +22,42 @@ import { buildFacilitator } from './facilitator.js';
 import { installRpcRetry } from './rpc-retry.js';
 import { RateLimiter } from './rate-limit.js';
 import { MemoryCatalogStore } from './catalog/memory.js';
+import { validateForCatalog } from './catalog/validation.js';
+
+const catalog = new MemoryCatalogStore();
+
+function enqueueCataloging(req, body, source = 'payment') {
+  // Off the hot path. Cataloging must never delay or fail a payment.
+  Promise.resolve().then(async () => {
+    try {
+      const checkResult = rateLimiter.checkCatalog(req);
+      if (!checkResult.allowed) {
+        console.warn(`[Catalog] Rate limit exceeded for IP ${req.ip}`);
+        return;
+      }
+
+      const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
+      if (validation.hardDrop) {
+        if (validation.reason !== 'missing_or_invalid_discovery_extension') {
+          console.warn(`[Catalog] Hard drop: ${validation.reason}`);
+        }
+        return;
+      }
+
+      rateLimiter.recordCatalog(req);
+
+      if (validation.softDrops.length > 0) {
+        console.warn(
+          `[Catalog] Soft drops for ${validation.resource.url}: ${validation.softDrops.join(', ')}`,
+        );
+      }
+
+      await catalog.upsertResource(validation.resource, source);
+    } catch (err) {
+      console.warn(`[Catalog] Async cataloging failed: ${err.message}`);
+    }
+  });
+}
 
 // Must run before the scheme makes any RPC call. Retries connection-level
 // failures only; see rpc-retry.js for what that deliberately excludes.
@@ -144,6 +180,9 @@ app.post('/verify', requireApiKey, async (req, res) => {
     rateLimiter.recordVerify(req);
     handleRateLimit(res, check);
     const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
+    if (result.isValid) {
+      enqueueCataloging(req, body, 'payment');
+    }
     res.json(result);
   } catch (err) {
     // An exception must not become a 500 with an empty body: to a client that
@@ -173,6 +212,9 @@ app.post('/settle', requireApiKey, async (req, res) => {
     const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
     rateLimiter.recordSettle(req, result.success ? result.transactionFeeStroops || 0 : 0);
     handleRateLimit(res, check);
+    if (result.success) {
+      enqueueCataloging(req, body, 'payment');
+    }
     res.json(result);
   } catch (err) {
     // SettleResponse requires `transaction` and `network` even on failure, so
@@ -187,7 +229,26 @@ app.post('/settle', requireApiKey, async (req, res) => {
   }
 });
 
-const catalog = new MemoryCatalogStore();
+app.post('/discovery/resources', requireApiKey, async (req, res) => {
+  const body = readPaymentBody(req, res);
+  if (!body) return;
+
+  const check = rateLimiter.checkCatalog(req);
+  if (!check.allowed) return handleRateLimit(res, check);
+
+  const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
+  if (validation.hardDrop) {
+    return res.status(400).json({ error: 'invalid_resource', reason: validation.reason });
+  }
+
+  rateLimiter.recordCatalog(req);
+  try {
+    const entry = await catalog.upsertResource(validation.resource, 'manual');
+    res.json({ ok: true, resource: entry, softDrops: validation.softDrops });
+  } catch (err) {
+    res.status(400).json({ error: 'catalog_error', reason: err.message });
+  }
+});
 
 app.get('/discovery/resources', async (req, res) => {
   let extensions;

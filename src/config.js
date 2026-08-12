@@ -72,6 +72,7 @@ export function resolveConfig(env = process.env) {
       settleRph: 100,
       settleRpd: 1000,
       feeSpd: 5000000,
+      catalogRpm: 10,
     };
     if (!str) return limits;
     str.split(',').forEach(pair => {
@@ -81,6 +82,7 @@ export function resolveConfig(env = process.env) {
       if (k === 'settle_rph') limits.settleRph = Number(v);
       if (k === 'settle_rpd') limits.settleRpd = Number(v);
       if (k === 'fee_spd') limits.feeSpd = Number(v);
+      if (k === 'catalog_rpm') limits.catalogRpm = Number(v);
     });
     return limits;
   };
