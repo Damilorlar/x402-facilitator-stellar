@@ -123,11 +123,13 @@ app.post('/settle', requireApiKey, async (req, res) => {
 app.listen(config.port, () => {
   console.log(`x402 Stellar facilitator listening on :${config.port}`);
   console.log(`  networks : ${config.networks.join(', ')}`);
-  for (const [network, address] of Object.entries(signers)) {
-    console.log(`  signer   : ${network} -> ${address}`);
+  for (const network of config.networks) {
+    const netConfig = config.perNetwork[network];
+    console.log(`  [${network}]`);
+    console.log(`    signer : ${signers[network]}`);
+    console.log(`    rpc    : ${netConfig.rpcUrl ?? '(package default)'}`);
+    console.log(`    max fee: ${netConfig.maxTransactionFeeStroops} stroops`);
   }
-  console.log(`  rpc      : ${config.rpcUrl ?? '(package default)'}`);
-  console.log(`  max fee  : ${config.maxTransactionFeeStroops} stroops`);
   if (config.apiKeys.length === 0) {
     console.log('  auth     : OPEN — no API keys configured (fine for free testnet)');
   } else {

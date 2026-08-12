@@ -144,10 +144,12 @@ curl -s localhost:3402/supported | jq
 |---|---|---|
 | `FACILITATOR_SECRET` | *required* | `S…` secret for the testnet signer |
 | `PORT` | `3402` | |
-| `STELLAR_RPC_URL` | package default | Public testnet RPC is fine; a provider URL is wanted for pubnet |
-| `MAX_TX_FEE_STROOPS` | `50000` | Fee ceiling per settlement. Configurable, never hard-wired |
+| `STELLAR_RPC_URL` | package default | Public testnet RPC is fine |
+| `STELLAR_RPC_URL_PUBNET` | *required if enabled* | A provider URL is required for pubnet |
+| `MAX_TX_FEE_STROOPS` | `50000` | Fee ceiling per settlement on testnet. Configurable, never hard-wired |
+| `MAX_TX_FEE_STROOPS_PUBNET` | `50000` | Fee ceiling per settlement on pubnet |
 | `FACILITATOR_API_KEYS` | *(unset)* | Comma-separated. Unset means open, which is correct for a free testnet instance and is logged at boot |
-| `ENABLE_PUBNET` | `false` | Requires `FACILITATOR_SECRET_PUBNET`; refuses to start without it |
+| `ENABLE_PUBNET` | `false` | Requires `FACILITATOR_SECRET_PUBNET` and `STELLAR_RPC_URL_PUBNET`; refuses to start without them |
 
 Pubnet is opt-in behind its own secret deliberately: running a mainnet facilitator from a
 testnet-shaped config loses real money.

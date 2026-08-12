@@ -32,19 +32,19 @@ export function buildFacilitator(config) {
   const signers = {};
 
   for (const network of config.networks) {
-    const secret = network === PUBNET ? config.secretPubnet : config.secret;
+    const netConfig = config.perNetwork[network];
 
     // createEd25519Signer yields a FacilitatorStellarSigner — address,
     // signAuthEntry, signTransaction.
-    const signer = createEd25519Signer(secret, network);
+    const signer = createEd25519Signer(netConfig.secret, network);
     signers[network] = signer.address;
 
     const scheme = new ExactStellarScheme([signer], {
       // areFeesSponsored defaults true and is surfaced through getExtra() into
       // /supported. Left at the default: the spec currently only supports true,
       // and advertising false while sponsoring would be a conformance failure.
-      rpcConfig: config.rpcUrl ? { url: config.rpcUrl } : undefined,
-      maxTransactionFeeStroops: config.maxTransactionFeeStroops,
+      rpcConfig: netConfig.rpcUrl ? { url: netConfig.rpcUrl } : undefined,
+      maxTransactionFeeStroops: netConfig.maxTransactionFeeStroops,
 
       // NOTE for the real build, not this spike: ExactStellarScheme accepts an
       // *array* of signers with a round-robin selectSigner, and an optional
