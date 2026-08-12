@@ -133,5 +133,7 @@ export function resolveConfig(env = process.env) {
      */
     apiKeys,
     rateLimits,
+    embeddingsUrl: env.EMBEDDINGS_URL || null,
+    enableReranking: env.ENABLE_RERANKING === 'true',
   };
 }
