@@ -38,6 +38,27 @@ curl "https://facilitator.example.com/discovery/resources?type=mcp&limit=10"
 }
 ```
 
+## API: `GET /discovery/search`
+
+Provides lexical full-text search over discovered resources, designed to be called by agents discovering tools on the fly.
+
+### Retrieval & Ranking
+The search performs a lexical match against:
+- `serviceName` (high weight)
+- `tags` (high weight for exact matches)
+- `description` (medium weight)
+- Parameter descriptions within `extensions` (low weight, but critical for agent legibility)
+
+Matches are ranked using these signals, and then boosted by:
+- **Provenance:** Resources verified via actual payments (`source: 'payment'`) outrank those manually registered.
+- **Recency:** A time-decay (half-life of ~43 days) is applied so live endpoints naturally outrank stale ones.
+
+### Cold Start
+Because ranking over an empty catalog is meaningless, the memory store relies on the testnet and pubnet instances being seeded with a curated set of example tools on startup (or via `POST /discovery/resources` in CI pipelines) to provide immediate utility for first-time callers.
+
+### Pagination & Degraded States
+Cursor pagination is implemented via the opaque `cursor` parameter. Both `limit` and `cursor` are *advisory* — the server may return fewer results. `partialResults` will be set to `true` if the backend is degraded (e.g. if a future Postgres migration fails to query all partitions), though currently it is always `false` in the memory-backed spike.
+
 ### Performance Target
 The p95 latency target for this endpoint is **<50ms**, ensuring it does not block agent interactive paths.
 

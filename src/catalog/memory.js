@@ -1,3 +1,5 @@
+import { scoreResource } from './search.js';
+
 export class MemoryCatalogStore {
   constructor() {
     this.resources = new Map();
@@ -85,6 +87,68 @@ export class MemoryCatalogStore {
     return {
       items: items.slice(offset, offset + limit),
       total,
+    };
+  }
+
+  async search(params) {
+    let items = Array.from(this.resources.values());
+
+    if (params.type) items = items.filter(r => r.type === params.type);
+    if (params.payTo) items = items.filter(r => r.payTo === params.payTo);
+    if (params.scheme) items = items.filter(r => r.scheme === params.scheme);
+    if (params.network) items = items.filter(r => r.network === params.network);
+    if (params.extensions && Array.isArray(params.extensions)) {
+      items = items.filter(r => {
+        const resourceExts = Object.keys(r.extensions || {});
+        return params.extensions.every(ext => resourceExts.includes(ext));
+      });
+    }
+
+    const scoredItems = [];
+    for (const item of items) {
+      const score = scoreResource(item, params.query);
+      if (score > 0) {
+        scoredItems.push({ item, score });
+      }
+    }
+
+    scoredItems.sort((a, b) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+      return this._key(a.item).localeCompare(this._key(b.item));
+    });
+
+    let parsedLimit = parseInt(params.limit, 10);
+    if (isNaN(parsedLimit)) parsedLimit = 20;
+    const limit = Math.min(Math.max(1, parsedLimit), 100);
+
+    let startIndex = 0;
+    if (params.cursor) {
+      try {
+        const cursorStr = Buffer.from(params.cursor, 'base64').toString('utf8');
+        if (cursorStr.startsWith('offset:')) {
+          startIndex = parseInt(cursorStr.substring(7), 10);
+        }
+      } catch {
+        // invalid cursor, ignore
+      }
+    }
+
+    const paginatedItems = scoredItems.slice(startIndex, startIndex + limit).map(s => s.item);
+
+    let nextCursor = null;
+    if (startIndex + limit < scoredItems.length) {
+      nextCursor = Buffer.from(`offset:${startIndex + limit}`).toString('base64');
+    }
+
+    return {
+      resources: paginatedItems,
+      partialResults: false,
+      pagination: {
+        limit,
+        cursor: nextCursor,
+      },
     };
   }
 }
