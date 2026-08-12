@@ -10,6 +10,7 @@ import { resolveConfig } from './config.js';
 import { buildFacilitator } from './facilitator.js';
 import { installRpcRetry } from './rpc-retry.js';
 import { RateLimiter } from './rate-limit.js';
+import { MemoryCatalogStore } from './catalog/memory.js';
 import { createApp } from './app.js';
 
 // Must run before the scheme makes any RPC call. Retries connection-level
@@ -20,6 +21,48 @@ const config = resolveConfig();
 const { facilitator, signers } = buildFacilitator(config);
 const rateLimiter = new RateLimiter(config.rateLimits);
 const app = createApp(config, facilitator, rateLimiter);
+
+const catalog = new MemoryCatalogStore();
+
+app.get('/discovery/resources', async (req, res) => {
+  let extensions;
+  if (req.query.extensions) {
+    extensions = Array.isArray(req.query.extensions)
+      ? req.query.extensions
+      : req.query.extensions.split(',');
+  }
+
+  const params = {
+    type: req.query.type,
+    payTo: req.query.payTo,
+    scheme: req.query.scheme,
+    network: req.query.network,
+    extensions,
+    limit: req.query.limit,
+    offset: req.query.offset,
+  };
+
+  try {
+    const result = await catalog.listResources(params);
+    let parsedLimit = parseInt(params.limit, 10);
+    if (isNaN(parsedLimit)) parsedLimit = 20;
+
+    let parsedOffset = parseInt(params.offset, 10);
+    if (isNaN(parsedOffset)) parsedOffset = 0;
+
+    res.json({
+      x402Version: 2,
+      items: result.items,
+      pagination: {
+        limit: Math.min(Math.max(1, parsedLimit), 100),
+        offset: Math.max(0, parsedOffset),
+        total: result.total,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'internal_error', message: err.message });
+  }
+});
 
 app.listen(config.port, () => {
   console.log(`x402 Stellar facilitator listening on :${config.port}`);
