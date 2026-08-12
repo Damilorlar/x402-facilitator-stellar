@@ -20,7 +20,7 @@ installRpcRetry({ log: msg => console.warn(`  ${msg}`) });
 const config = resolveConfig();
 const { facilitator, signers } = buildFacilitator(config);
 const rateLimiter = new RateLimiter(config.rateLimits);
-const catalog = new MemoryCatalogStore();
+const catalog = new MemoryCatalogStore(config);
 const app = createApp(config, facilitator, rateLimiter, catalog);
 
 app.listen(config.port, () => {

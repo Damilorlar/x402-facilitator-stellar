@@ -45,7 +45,7 @@ test('Catalog search tests', async t => {
     assert.ok(res.pagination, 'Has pagination');
     assert.strictEqual(res.total, undefined, 'Does not have total');
     assert.strictEqual(res.resources.length, 2);
-    assert.strictEqual(res.partialResults, false);
+    assert.strictEqual(res.partialResults, true); // true because no embedding provider is configured
   });
 
   await t.test('filters compose with query', async () => {
@@ -86,8 +86,8 @@ test('Catalog search tests', async t => {
     assert.notStrictEqual(page1.resources[0].url, page2.resources[0].url);
   });
 
-  await t.test('partialResults is truthful (always false in memory)', async () => {
+  await t.test('partialResults is truthful (true when provider is unavailable)', async () => {
     const res = await store.search({ query: 'api' });
-    assert.strictEqual(res.partialResults, false);
+    assert.strictEqual(res.partialResults, true);
   });
 });

@@ -91,4 +91,15 @@ We track the following metrics on our test set:
 | Release | Date | P@3 | R@3 | MRR | nDCG | Notes |
 |---------|------|-----|-----|-----|------|-------|
 | `v0.0.1` | 2026-08-12 | 0.625 | 1.000 | 1.000 | 0.991 | Initial lexical baseline release |
+| `v0.0.2` | 2026-08-12 | 0.583 | 1.000 | 1.000 | 1.000 | Hybrid semantic search via API |
+
+## Full Re-index Procedure
+
+Because this is an in-memory conformance spike, re-indexing is implicit on restart. All catalog items are rebuilt as payments arrive.
+
+For a persistent deployment, a full re-index (required when changing the embedding model) is performed by:
+1. Configuring the new embedding model endpoint.
+2. Iterating through the primary catalog table.
+3. Repopulating the dense vectors.
+4. Hot-swapping the new vector index.
 

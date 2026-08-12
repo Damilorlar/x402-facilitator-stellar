@@ -1,8 +1,25 @@
 import { scoreResource } from './search.js';
+import { EmbeddingClient } from './embeddings.js';
+
+function cosineSimilarity(vecA, vecB) {
+  if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
 
 export class MemoryCatalogStore {
-  constructor() {
+  constructor(config = {}) {
     this.resources = new Map();
+    this.embeddingClient = new EmbeddingClient(config.embeddingsUrl);
+    this.enableReranking = config.enableReranking;
   }
 
   _key(resource) {
@@ -42,6 +59,22 @@ export class MemoryCatalogStore {
     };
 
     this.resources.set(key, entry);
+
+    // Re-embed asynchronously without blocking the upsert (or the payment path)
+    if (this.embeddingClient.url) {
+      Promise.resolve().then(async () => {
+        try {
+          const text = this.embeddingClient.composeDocument(entry);
+          const vector = await this.embeddingClient.embed(text);
+          if (vector) {
+            entry.embedding = vector;
+          }
+        } catch (err) {
+          console.warn(`[Catalog] Failed to re-embed ${key}: ${err.message}`);
+        }
+      });
+    }
+
     return entry;
   }
 
@@ -104,15 +137,67 @@ export class MemoryCatalogStore {
       });
     }
 
-    const scoredItems = [];
+    let partialResults = false;
+    let queryVector = null;
+
+    if (this.embeddingClient.url) {
+      queryVector = await this.embeddingClient.embed(params.query);
+      if (!queryVector) {
+        partialResults = true;
+      }
+    } else {
+      partialResults = true; // No provider available
+    }
+
+    const lexicalScores = [];
+    const denseScores = [];
+
     for (const item of items) {
-      const score = scoreResource(item, params.query);
-      if (score > 0) {
-        scoredItems.push({ item, score });
+      const lexScore = scoreResource(item, params.query);
+      if (lexScore > 0) {
+        lexicalScores.push({ item, score: lexScore });
+      }
+
+      if (queryVector) {
+        if (item.embedding) {
+          const denseScore = cosineSimilarity(queryVector, item.embedding);
+          if (denseScore > 0.1) {
+            // Threshold for relevance
+            denseScores.push({ item, score: denseScore });
+          }
+        } else {
+          // Resource hasn't been embedded yet or embedding failed
+          partialResults = true;
+        }
       }
     }
 
-    scoredItems.sort((a, b) => {
+    // Rank and assign RRF (Reciprocal Rank Fusion)
+    const k = 60;
+    const rrfScores = new Map(); // item key -> rrf score
+
+    lexicalScores.sort((a, b) => b.score - a.score);
+    lexicalScores.forEach((s, rank) => {
+      const key = this._key(s.item);
+      rrfScores.set(key, 1 / (k + rank + 1));
+    });
+
+    denseScores.sort((a, b) => b.score - a.score);
+    denseScores.forEach((s, rank) => {
+      const key = this._key(s.item);
+      const current = rrfScores.get(key) || 0;
+      rrfScores.set(key, current + 1 / (k + rank + 1));
+    });
+
+    const combinedItems = [];
+    for (const item of items) {
+      const key = this._key(item);
+      if (rrfScores.has(key)) {
+        combinedItems.push({ item, score: rrfScores.get(key) });
+      }
+    }
+
+    combinedItems.sort((a, b) => {
       if (b.score !== a.score) {
         return b.score - a.score;
       }
@@ -135,16 +220,20 @@ export class MemoryCatalogStore {
       }
     }
 
-    const paginatedItems = scoredItems.slice(startIndex, startIndex + limit).map(s => s.item);
+    let paginatedItems = combinedItems.slice(startIndex, startIndex + limit).map(s => s.item);
+
+    if (this.enableReranking && paginatedItems.length > 0) {
+      paginatedItems = await this.embeddingClient.rerank(params.query, paginatedItems);
+    }
 
     let nextCursor = null;
-    if (startIndex + limit < scoredItems.length) {
+    if (startIndex + limit < combinedItems.length) {
       nextCursor = Buffer.from(`offset:${startIndex + limit}`).toString('base64');
     }
 
     return {
       resources: paginatedItems,
-      partialResults: false,
+      partialResults,
       pagination: {
         limit,
         cursor: nextCursor,

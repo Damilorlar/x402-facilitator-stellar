@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import http from 'node:http';
 import { MemoryCatalogStore } from '../src/catalog/memory.js';
 
 // Calculate DCG for a list of relevance scores
@@ -20,7 +21,45 @@ async function runEval() {
   const fixtures = JSON.parse(fs.readFileSync(catalogPath, 'utf8'));
   const judgements = JSON.parse(fs.readFileSync(queriesPath, 'utf8'));
 
-  const store = new MemoryCatalogStore();
+  // Mock Embedding Server
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', chunk => (body += chunk));
+    req.on('end', () => {
+      try {
+        if (req.url === '/embed') {
+          const { input } = JSON.parse(body);
+          // Very simple deterministic vector mock
+          const vec = new Array(3).fill(0);
+          const lower = input.toLowerCase();
+          if (lower.includes('weather') || lower.includes('climate')) vec[0] = 1;
+          if (lower.includes('finance') || lower.includes('currency')) vec[1] = 1;
+          if (lower.includes('latitude') || lower.includes('longitude')) vec[2] = 1;
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ embedding: vec }));
+        } else if (req.url === '/rerank') {
+          const { documents } = JSON.parse(body);
+          // Mock reranker: just return 1.0 for everything, preserving order
+          const scores = documents.map(() => 1.0);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ scores }));
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      } catch {
+        res.writeHead(500);
+        res.end();
+      }
+    });
+  });
+
+  await new Promise(resolve => server.listen(0, resolve));
+  const port = server.address().port;
+  const embeddingsUrl = `http://localhost:${port}/embed`;
+
+  const store = new MemoryCatalogStore({ embeddingsUrl, enableReranking: true });
 
   // Load fixtures into memory store
   const now = Date.now();
@@ -32,6 +71,9 @@ async function runEval() {
       item.last_seen_at = new Date(now - f.daysOld * 24 * 60 * 60 * 1000);
     }
   }
+
+  // Wait a tick for async background embeddings to finish
+  await new Promise(resolve => setTimeout(resolve, 100));
 
   const K = 3;
   let totalPrecision = 0;
@@ -134,9 +176,11 @@ async function runEval() {
   }
 
   if (failed) {
+    server.close();
     process.exit(1);
   } else {
     console.log('\n✅ Evaluation passed!');
+    server.close();
   }
 }
 
