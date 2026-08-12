@@ -2,6 +2,7 @@
   <h1>x402-facilitator-stellar</h1>
   <p><strong>An x402 facilitator for Stellar — verify, settle, supported</strong></p>
   <p>
+    <img src="https://img.shields.io/github/actions/workflow/status/accensa/x402-facilitator-stellar/ci.yml?branch=main" alt="CI Status" />
     <img src="https://img.shields.io/badge/status-conformance%20spike-orange.svg" alt="Status: conformance spike" />
     <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License Apache 2.0" />
     <img src="https://img.shields.io/badge/stellar-testnet-success.svg" alt="Stellar testnet" />
@@ -147,6 +148,25 @@ curl -s localhost:3402/supported | jq
   "extensions": [],
   "signers": { "stellar:*": ["G..."] }
 }
+```
+
+### Tests
+
+```bash
+npm test              # unit tests — no network, no funded account, no .env
+npm run lint          # eslint
+npm run format:check  # prettier, check only
+npm run licenses      # fails on any AGPL in the dependency path
+```
+
+All four run in CI on every push and pull request, across Node 20 and 22.
+
+The end-to-end conformance run is separate, because it needs testnet and two
+funded accounts:
+
+```bash
+FACILITATOR_SECRET=$(stellar keys show facilitator) npm start &
+ALICE_SECRET=$(stellar keys show alice) npm run e2e
 ```
 
 ### Privacy and Data Minimisation
