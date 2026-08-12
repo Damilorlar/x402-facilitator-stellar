@@ -1,132 +1,119 @@
-import test from 'node:test';
+/**
+ * Caller authentication over HTTP.
+ *
+ * Every assertion here is carried over from the original subprocess version.
+ * What changed is how the server is obtained: this builds the app in-process
+ * via createApp rather than spawning `node src/server.js` and polling stdout
+ * for "listening on".
+ *
+ * That mattered in practice. The spawn version had no timeout, so when
+ * src/config.js was merged in a state that did not parse, the child died on
+ * startup, the "listening on" line never arrived, and the promise never
+ * settled — the suite reported `Promise resolution is still pending but the
+ * event loop has already resolved` instead of the syntax error. It also bound
+ * fixed ports (3409, 3410) and needed a real keypair to get past boot.
+ */
+import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { join } from 'node:path';
-import { Keypair } from '@stellar/stellar-sdk';
+import { serve, testConfig, VALID_BODY } from './helpers/app.js';
 
-function startServer(env) {
-  return new Promise((resolve, reject) => {
-    const serverProcess = spawn('node', ['src/server.js'], {
-      env: { ...process.env, ...env },
-      cwd: join(import.meta.dirname, '..'),
-    });
-
-    serverProcess.stdout.on('data', data => {
-      if (data.toString().includes('listening on')) {
-        resolve(serverProcess);
-      }
-    });
-
-    serverProcess.stderr.on('data', data => {
-      console.error(`server error: ${data}`);
-    });
-
-    serverProcess.on('error', err => reject(err));
+describe('with API keys configured', () => {
+  let app;
+  before(async () => {
+    app = await serve({ config: testConfig({ apiKeys: ['admin:supersecret'] }) });
   });
-}
+  after(() => app.close());
 
-test('auth middleware tests', async t => {
-  const PORT = 3409;
-  const env = {
-    PORT: PORT.toString(),
-    FACILITATOR_SECRET: Keypair.random().secret(),
-    FACILITATOR_API_KEYS: 'admin:supersecret',
-  };
-
-  const server = await startServer(env);
-
-  t.after(() => {
-    server.kill();
-  });
-
-  const baseUrl = `http://localhost:${PORT}`;
-
-  await t.test('missing header', async () => {
-    const res = await fetch(`${baseUrl}/verify`, {
-      method: 'POST',
-      body: '{}',
-      headers: { 'content-type': 'application/json' },
-    });
+  test('missing header', async () => {
+    const res = await app.post('/verify', {});
     assert.equal(res.status, 401);
-    const json = await res.json();
-    assert.equal(json.reason, 'missing_auth_header');
+    assert.equal((await res.json()).reason, 'missing_auth_header');
   });
 
-  await t.test('malformed header', async () => {
-    const res = await fetch(`${baseUrl}/verify`, {
-      method: 'POST',
-      body: '{}',
-      headers: {
-        'content-type': 'application/json',
-        authorization: 'Bearer token extra',
-      },
-    });
+  test('malformed header', async () => {
+    const res = await app.post('/verify', {}, { authorization: 'Bearer token extra' });
     assert.equal(res.status, 401);
-    const json = await res.json();
-    assert.equal(json.reason, 'malformed_auth_header');
+    assert.equal((await res.json()).reason, 'malformed_auth_header');
   });
 
-  await t.test('invalid key', async () => {
-    const res = await fetch(`${baseUrl}/verify`, {
-      method: 'POST',
-      body: '{}',
-      headers: {
-        'content-type': 'application/json',
-        authorization: 'Bearer wrongsecret',
-      },
-    });
+  test('invalid key', async () => {
+    const res = await app.post('/verify', {}, { authorization: 'Bearer wrongsecret' });
     assert.equal(res.status, 401);
-    const json = await res.json();
-    assert.equal(json.reason, 'invalid_api_key');
+    assert.equal((await res.json()).reason, 'invalid_api_key');
   });
 
-  await t.test('valid key (Bearer)', async () => {
-    const res = await fetch(`${baseUrl}/verify`, {
-      method: 'POST',
-      body: '{}',
-      headers: {
-        'content-type': 'application/json',
-        authorization: 'Bearer supersecret',
-      },
-    });
-    // It should pass auth and return 400 bad request from readPaymentBody
+  test('valid key (Bearer) passes auth and reaches body validation', async () => {
+    // 400, not 401: the empty body is rejected by readPaymentBody, which only
+    // runs once the key has been accepted.
+    const res = await app.post('/verify', {}, { authorization: 'Bearer supersecret' });
     assert.equal(res.status, 400);
   });
 
-  await t.test('valid key (plain)', async () => {
-    const res = await fetch(`${baseUrl}/verify`, {
-      method: 'POST',
-      body: '{}',
-      headers: {
-        'content-type': 'application/json',
-        authorization: 'supersecret',
-      },
-    });
+  test('valid key (plain, no Bearer prefix)', async () => {
+    const res = await app.post('/verify', {}, { authorization: 'supersecret' });
     assert.equal(res.status, 400);
+  });
+
+  test('a wrong key of a different length is rejected, not crashed on', async () => {
+    // timingSafeEqual throws on length mismatch, which is why the comparison is
+    // over fixed-width SHA-256 digests rather than the raw keys.
+    const res = await app.post('/verify', {}, { authorization: 'Bearer x' });
+    assert.equal(res.status, 401);
+    assert.equal((await res.json()).reason, 'invalid_api_key');
+  });
+
+  test('the key id is attached to the request, not the key', async () => {
+    // /usage echoes req.keyId, which is how a caller is identified in metering
+    // and logs without the secret travelling with it.
+    const res = await app.get('/usage', { authorization: 'Bearer supersecret' });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).keyId, 'admin');
+  });
+
+  test('both /verify and /settle are protected', async () => {
+    for (const route of ['/verify', '/settle']) {
+      const res = await app.post(route, VALID_BODY);
+      assert.equal(res.status, 401, `${route} must require a key`);
+    }
   });
 });
 
-test('open mode tests', async t => {
-  const PORT = 3410;
-  const env = {
-    PORT: PORT.toString(),
-    FACILITATOR_SECRET: Keypair.random().secret(),
-  };
+describe('with several keys configured', () => {
+  let app;
+  before(async () => {
+    app = await serve({ config: testConfig({ apiKeys: ['first:aaa', 'second:bbb'] }) });
+  });
+  after(() => app.close());
 
-  const server = await startServer(env);
+  test('every key works, not just the first', async () => {
+    for (const [key, id] of [
+      ['aaa', 'first'],
+      ['bbb', 'second'],
+    ]) {
+      const res = await app.get('/usage', { authorization: `Bearer ${key}` });
+      assert.equal(res.status, 200);
+      assert.equal((await res.json()).keyId, id);
+    }
+  });
+});
 
-  t.after(() => {
-    server.kill();
+describe('open mode', () => {
+  let app;
+  before(async () => {
+    app = await serve();
+  });
+  after(() => app.close());
+
+  test('passes without a header', async () => {
+    // 400 because the body is empty, but auth passed — which is the point.
+    const res = await app.post('/verify', {});
+    assert.equal(res.status, 400);
   });
 
-  const baseUrl = `http://localhost:${PORT}`;
-
-  await t.test('passes without header', async () => {
-    const res = await fetch(`${baseUrl}/verify`, {
-      method: 'POST',
-      body: '{}',
-      headers: { 'content-type': 'application/json' },
-    });
-    assert.equal(res.status, 400); // Bad request because body is empty, but auth passed
+  test('an Authorization header is ignored rather than rejected', async () => {
+    // With no keys configured there is nothing to check it against, and
+    // refusing a caller who volunteered one would be surprising.
+    const res = await app.post('/verify', {}, { authorization: 'Bearer anything' });
+    assert.equal(res.status, 400);
   });
 });
