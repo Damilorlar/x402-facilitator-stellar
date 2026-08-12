@@ -12,3 +12,14 @@ A key distinction is drawn between controls implemented in this repository ("Our
 | **Caller credentials** | Key leakage, timing attacks, missing rotation | API keys passed via headers; constant-time comparison. | Ours | Stolen API keys grant full access until rotated. |
 | **Availability** | RPC dependency, database dependency, signer exhaustion | Timeouts on RPC/DB calls. (Signer burst handling is a known gap). | Ours | Upstream RPC outages will take down the facilitator. |
 | **Privacy** | Who paid whom for what, and who can see it | Strict data minimisation and retention policy. See [PRIVACY.md](./PRIVACY.md). | Ours | Operator with database access can see history up to the retention limits. |
+
+## Catalog Poisoning
+
+The facilitator acts as a trust boundary for the Discovery Catalog (Bazaar). Because clients echo the resource block into the payment payload, every field in a listing is attacker-controlled.
+
+Expected attacks include:
+- **Path Traversal:** Escaping validation via percent-encoded `..` or scheme separators in `routeTemplate`.
+- **Catalog Poisoning:** Forged `serviceName`, oversized `description`, or tag flooding designed to outrank legitimate listings or bloat the index.
+- **SSRF / Tracking Probes:** Supplying an `iconUrl` pointing to private IP ranges or tracking pixels.
+
+To mitigate these, the facilitator enforces strict validation and dropping policies. See the **[Validation & Cataloging Policy in BAZAAR.md](./BAZAAR.md#validation--cataloging-policy)** for detailed outcomes on hard/soft drops and resource caps per seller.
