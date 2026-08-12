@@ -61,6 +61,33 @@ export function resolveConfig(env = process.env) {
     };
   });
 
+  // Parse Rate Limits
+  const parseLimits = (str) => {
+    const limits = { verifyRpm: 60, settleRpm: 10, settleRph: 100, settleRpd: 1000, feeSpd: 5000000 };
+    if (!str) return limits;
+    str.split(',').forEach(pair => {
+      const [k, v] = pair.split('=');
+      if (k === 'verify_rpm') limits.verifyRpm = Number(v);
+      if (k === 'settle_rpm') limits.settleRpm = Number(v);
+      if (k === 'settle_rph') limits.settleRph = Number(v);
+      if (k === 'settle_rpd') limits.settleRpd = Number(v);
+      if (k === 'fee_spd') limits.feeSpd = Number(v);
+    });
+    return limits;
+  };
+
+  const rateLimits = {
+    global: parseLimits(env.RATE_LIMIT_GLOBAL),
+    keys: {}
+  };
+
+  for (const k of Object.keys(env)) {
+    if (k.startsWith('RATE_LIMIT_') && k !== 'RATE_LIMIT_GLOBAL') {
+      const keyId = k.substring(11); // remove RATE_LIMIT_
+      rateLimits.keys[keyId] = parseLimits(env[k]);
+    }
+  }
+
   return {
     port: Number(env.PORT ?? 3402),
     secret,
@@ -88,5 +115,6 @@ export function resolveConfig(env = process.env) {
      * configurable).
      */
     apiKeys,
+    rateLimits,
   };
 }
