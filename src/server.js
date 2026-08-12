@@ -204,14 +204,14 @@ app.get('/discovery/resources', async (req, res) => {
     network: req.query.network,
     extensions,
     limit: req.query.limit,
-    offset: req.query.offset
+    offset: req.query.offset,
   };
 
   try {
     const result = await catalog.listResources(params);
     let parsedLimit = parseInt(params.limit, 10);
     if (isNaN(parsedLimit)) parsedLimit = 20;
-    
+
     let parsedOffset = parseInt(params.offset, 10);
     if (isNaN(parsedOffset)) parsedOffset = 0;
 
@@ -221,8 +221,8 @@ app.get('/discovery/resources', async (req, res) => {
       pagination: {
         limit: Math.min(Math.max(1, parsedLimit), 100),
         offset: Math.max(0, parsedOffset),
-        total: result.total
-      }
+        total: result.total,
+      },
     });
   } catch (err) {
     res.status(500).json({ error: 'internal_error', message: err.message });
