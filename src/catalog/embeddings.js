@@ -52,7 +52,7 @@ export class EmbeddingClient {
 
       const data = await response.json();
       return data.embedding;
-    } catch (err) {
+    } catch {
       // Network failure, degrade gracefully
       return null;
     }
@@ -92,7 +92,7 @@ export class EmbeddingClient {
       }
 
       return resources;
-    } catch (err) {
+    } catch {
       return resources;
     }
   }

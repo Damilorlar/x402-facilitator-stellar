@@ -39,7 +39,7 @@ async function runEval() {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ embedding: vec }));
         } else if (req.url === '/rerank') {
-          const { query, documents } = JSON.parse(body);
+          const { documents } = JSON.parse(body);
           // Mock reranker: just return 1.0 for everything, preserving order
           const scores = documents.map(() => 1.0);
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -48,7 +48,7 @@ async function runEval() {
           res.writeHead(404);
           res.end();
         }
-      } catch (err) {
+      } catch {
         res.writeHead(500);
         res.end();
       }
