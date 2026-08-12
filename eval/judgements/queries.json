@@ -1,0 +1,31 @@
+[
+  {
+    "query": "weather forecast",
+    "description": "User wants to check current weather conditions",
+    "expected": {
+      "https://api.weather.example/v1": 3,
+      "https://api.oldweather.example": 1,
+      "https://api.poison.example/weather": 0
+    }
+  },
+  {
+    "query": "an API that converts currency",
+    "description": "User wants to convert money",
+    "expected": {
+      "https://api.finance.example/v2": 3,
+      "https://api.poison.example/weather": 0
+    }
+  },
+  {
+    "query": "latitude longitude climate",
+    "description": "Checking if extensions parameters are indexed and weighted",
+    "expected": {
+      "https://api.weather.example/v1": 3
+    }
+  },
+  {
+    "query": "image generation",
+    "description": "Empty-result case",
+    "expected": {}
+  }
+]

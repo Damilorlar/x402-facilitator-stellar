@@ -85,3 +85,16 @@ jobs:
       # dependency path. That commitment is enforced here rather than asserted
       # in a README.
       - run: node scripts/check-licenses.mjs --list
+
+  eval:
+    name: eval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      # Search evaluation gate
+      - run: npm run eval
