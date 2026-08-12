@@ -21,6 +21,7 @@ import { resolveConfig } from './config.js';
 import { buildFacilitator } from './facilitator.js';
 import { installRpcRetry } from './rpc-retry.js';
 import { RateLimiter } from './rate-limit.js';
+import { MemoryCatalogStore } from './catalog/memory.js';
 
 // Must run before the scheme makes any RPC call. Retries connection-level
 // failures only; see rpc-retry.js for what that deliberately excludes.
@@ -183,6 +184,48 @@ app.post('/settle', requireApiKey, async (req, res) => {
       transaction: '',
       network: req.body?.paymentRequirements?.network,
     });
+  }
+});
+
+const catalog = new MemoryCatalogStore();
+
+app.get('/discovery/resources', async (req, res) => {
+  let extensions;
+  if (req.query.extensions) {
+    extensions = Array.isArray(req.query.extensions)
+      ? req.query.extensions
+      : req.query.extensions.split(',');
+  }
+
+  const params = {
+    type: req.query.type,
+    payTo: req.query.payTo,
+    scheme: req.query.scheme,
+    network: req.query.network,
+    extensions,
+    limit: req.query.limit,
+    offset: req.query.offset,
+  };
+
+  try {
+    const result = await catalog.listResources(params);
+    let parsedLimit = parseInt(params.limit, 10);
+    if (isNaN(parsedLimit)) parsedLimit = 20;
+
+    let parsedOffset = parseInt(params.offset, 10);
+    if (isNaN(parsedOffset)) parsedOffset = 0;
+
+    res.json({
+      x402Version: 2,
+      items: result.items,
+      pagination: {
+        limit: Math.min(Math.max(1, parsedLimit), 100),
+        offset: Math.max(0, parsedOffset),
+        total: result.total,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'internal_error', message: err.message });
   }
 });
 
