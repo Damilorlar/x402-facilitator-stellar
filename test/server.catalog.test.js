@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import express from 'express';
 import { validateForCatalog } from '../src/catalog/validation.js';
 
 test('Async Cataloging Non-blocking', async t => {
@@ -40,7 +39,7 @@ test('Async Cataloging Non-blocking', async t => {
             payload.paymentRequirements,
           );
           await mockCatalog.upsertResource(validation.resource, 'payment');
-        } catch (err) {
+        } catch {
           // Handled silently
         }
       });
