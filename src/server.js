@@ -42,7 +42,7 @@ app.use(express.json({ limit: '256kb' }));
  */
 function requireApiKey(req, res, next) {
   if (config.apiKeys.length === 0) return next();
-  
+
   const authHeader = req.get('authorization');
   if (!authHeader) {
     return res.status(401).json({ error: 'unauthorized', reason: 'missing_auth_header' });
@@ -64,7 +64,10 @@ function requireApiKey(req, res, next) {
   const presentedHash = crypto.createHash('sha256').update(presentedKey).digest();
 
   for (const apiKey of config.apiKeys) {
-    if (presentedHash.length === apiKey.hash.length && crypto.timingSafeEqual(presentedHash, apiKey.hash)) {
+    if (
+      presentedHash.length === apiKey.hash.length &&
+      crypto.timingSafeEqual(presentedHash, apiKey.hash)
+    ) {
       req.keyId = apiKey.id;
       return next();
     }

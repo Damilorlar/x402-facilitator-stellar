@@ -1,40 +1,35 @@
 #!/usr/bin/env node
 
 /**
- * X402 Facilitator Data Retention Job
- * 
- * Enforces the data minimisation and retention policy:
- * - Request Logs: 7 days
- * - Search Queries: 30 days
- * - Settlement Records: 90 days
+ * Data retention job — NOT YET IMPLEMENTED.
+ *
+ * Intended to enforce the retention policy in docs/PRIVACY.md:
+ *   request logs        7 days
+ *   search queries     30 days
+ *   settlement records 90 days
+ *
+ * There is no datastore to purge from yet, so this deletes nothing. It exits
+ * non-zero so that scheduling it is impossible to mistake for enforcing the
+ * policy: a stub that prints "[OK] Purged ..." and returns success is worse
+ * than no job at all, because it makes an unenforced policy look enforced.
+ *
+ * See the tracking issue for what has to land before this can do its job.
  */
 
-// This is a stub implementation representing the deletion job.
-// Once a database connection (e.g. Postgres or SQLite) is fully integrated, 
-// this script should execute DELETE queries.
+const RETENTION_DAYS = {
+  'request logs': 7,
+  'search queries': 30,
+  'settlement records': 90,
+};
 
-const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
-
-async function purgeExpiredData() {
-    console.log("Starting data retention purge job...");
-    const now = Date.now();
-    
-    // Example: pseudo-SQL logic
-    // await db.query('DELETE FROM request_logs WHERE timestamp < ?', [new Date(now - SEVEN_DAYS_MS)]);
-    console.log(`[OK] Purged request logs older than 7 days`);
-    
-    // await db.query('DELETE FROM search_queries WHERE timestamp < ?', [new Date(now - THIRTY_DAYS_MS)]);
-    console.log(`[OK] Purged search queries older than 30 days`);
-
-    // await db.query('DELETE FROM settlement_records WHERE timestamp < ?', [new Date(now - NINETY_DAYS_MS)]);
-    console.log(`[OK] Purged settlement records older than 90 days`);
-
-    console.log("Data retention purge job completed successfully.");
+console.error('data-retention: NOT IMPLEMENTED — nothing was purged.\n');
+console.error('The policy this job is supposed to enforce:');
+for (const [what, days] of Object.entries(RETENTION_DAYS)) {
+  console.error(`  ${what.padEnd(20)} ${days} days`);
 }
+console.error(
+  '\nBlocked on a datastore: the service holds no persistent records to purge.\n' +
+    'Until then docs/PRIVACY.md must not claim these periods are enforced.',
+);
 
-purgeExpiredData().catch(err => {
-    console.error("Failed to run data retention job:", err);
-    process.exit(1);
-});
+process.exit(1);
