@@ -3,6 +3,8 @@
  * rather than on the first payment.
  */
 
+import crypto from 'node:crypto';
+
 /** CAIP-2 identifiers. Both are committed deliverables in the RFP, not one or the other. */
 export const TESTNET = 'stellar:testnet';
 export const PUBNET = 'stellar:pubnet';
@@ -40,6 +42,25 @@ export function resolveConfig(env = process.env) {
     throw new Error('FACILITATOR_SECRET must be a Stellar secret key (starts with S).');
   }
 
+  const rawApiKeys = (env.FACILITATOR_API_KEYS ?? '')
+    .split(',')
+    .map(k => k.trim())
+    .filter(Boolean);
+
+  const apiKeys = rawApiKeys.map((keyStr, index) => {
+    let id = `key_${index}`;
+    let secretPart = keyStr;
+    const colonIdx = keyStr.indexOf(':');
+    if (colonIdx > 0) {
+      id = keyStr.substring(0, colonIdx);
+      secretPart = keyStr.substring(colonIdx + 1);
+    }
+    return {
+      id,
+      hash: crypto.createHash('sha256').update(secretPart).digest()
+    };
+  });
+
   return {
     port: Number(env.PORT ?? 3402),
     secret,
@@ -66,9 +87,6 @@ export function resolveConfig(env = process.env) {
      * when it is unset (RFP §3.1: the mechanism must be documented and
      * configurable).
      */
-    apiKeys: (env.FACILITATOR_API_KEYS ?? '')
-      .split(',')
-      .map(k => k.trim())
-      .filter(Boolean),
+    apiKeys,
   };
 }

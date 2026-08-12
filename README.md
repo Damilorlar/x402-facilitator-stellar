@@ -146,7 +146,7 @@ curl -s localhost:3402/supported | jq
 | `PORT` | `3402` | |
 | `STELLAR_RPC_URL` | package default | Public testnet RPC is fine; a provider URL is wanted for pubnet |
 | `MAX_TX_FEE_STROOPS` | `50000` | Fee ceiling per settlement. Configurable, never hard-wired |
-| `FACILITATOR_API_KEYS` | *(unset)* | Comma-separated. Unset means open, which is correct for a free testnet instance and is logged at boot |
+| `FACILITATOR_API_KEYS` | *(unset)* | Comma-separated. See [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md). Unset means open. |
 | `ENABLE_PUBNET` | `false` | Requires `FACILITATOR_SECRET_PUBNET`; refuses to start without it |
 
 Pubnet is opt-in behind its own secret deliberately: running a mainnet facilitator from a
