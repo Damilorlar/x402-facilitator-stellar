@@ -1,5 +1,5 @@
 /**
- * The HTTP surface: /verify, /settle, /supported, /usage.
+ * The HTTP surface: /verify, /settle, /supported, /usage, /discovery/resources.
  *
  * @x402/core ships no facilitator router — it gives you x402Facilitator with
  * verify(), settle() and getSupported(), and the transport is yours. This file
@@ -21,13 +21,15 @@
  */
 import crypto from 'node:crypto';
 import express from 'express';
+import { validateForCatalog } from './catalog/validation.js';
 
 /**
  * Builds the Express app.
  *
- * Takes its three collaborators rather than reaching for module state, which is
- * what makes the surface testable: a test can supply a facilitator that throws,
- * or a rate limiter already at its ceiling, without a network or a keypair.
+ * Takes its collaborators rather than reaching for module state, which is what
+ * makes the surface testable: a test can supply a facilitator that throws, a
+ * rate limiter already at its ceiling, or a catalog that rejects a write,
+ * without a network, a keypair or a subprocess.
  *
  * `signers` is deliberately not a parameter — no route reads it. The addresses
  * reach the wire through facilitator.getSupported(); server.js keeps them only
@@ -35,13 +37,53 @@ import express from 'express';
  *
  * @param {object} config - resolved config from resolveConfig()
  * @param {{verify: Function, settle: Function, getSupported: Function}} facilitator
- * @param {{checkVerify: Function, recordVerify: Function, checkSettle: Function,
- *          recordSettle: Function, getUsage: Function}} rateLimiter
+ * @param {object} rateLimiter - RateLimiter, or a stub with the same surface
+ * @param {{upsertResource: Function, listResources: Function}} catalog
  * @returns {import('express').Express}
  */
-export function createApp(config, facilitator, rateLimiter) {
+export function createApp(config, facilitator, rateLimiter, catalog) {
   const app = express();
   app.use(express.json({ limit: '256kb' }));
+
+  /**
+   * Catalogs a resource declared in a payment, off the hot path.
+   *
+   * Cataloging must never delay or fail a payment: the work is enqueued and the
+   * payment response returns immediately. A cataloging failure is logged, never
+   * surfaced as a payment failure.
+   */
+  function enqueueCataloging(req, body, source = 'payment') {
+    // Off the hot path. Cataloging must never delay or fail a payment.
+    Promise.resolve().then(async () => {
+      try {
+        const checkResult = rateLimiter.checkCatalog(req);
+        if (!checkResult.allowed) {
+          console.warn(`[Catalog] Rate limit exceeded for IP ${req.ip}`);
+          return;
+        }
+
+        const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
+        if (validation.hardDrop) {
+          if (validation.reason !== 'missing_or_invalid_discovery_extension') {
+            console.warn(`[Catalog] Hard drop: ${validation.reason}`);
+          }
+          return;
+        }
+
+        rateLimiter.recordCatalog(req);
+
+        if (validation.softDrops.length > 0) {
+          console.warn(
+            `[Catalog] Soft drops for ${validation.resource.url}: ${validation.softDrops.join(', ')}`,
+          );
+        }
+
+        await catalog.upsertResource(validation.resource, source);
+      } catch (err) {
+        console.warn(`[Catalog] Async cataloging failed: ${err.message}`);
+      }
+    });
+  }
 
   /**
    * Caller authentication.
@@ -153,6 +195,9 @@ export function createApp(config, facilitator, rateLimiter) {
       rateLimiter.recordVerify(req);
       handleRateLimit(res, check);
       const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
+      if (result.isValid) {
+        enqueueCataloging(req, body, 'payment');
+      }
       res.json(result);
     } catch (err) {
       // An exception must not become a 500 with an empty body: to a client that
@@ -182,6 +227,9 @@ export function createApp(config, facilitator, rateLimiter) {
       const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
       rateLimiter.recordSettle(req, result.success ? result.transactionFeeStroops || 0 : 0);
       handleRateLimit(res, check);
+      if (result.success) {
+        enqueueCataloging(req, body, 'payment');
+      }
       res.json(result);
     } catch (err) {
       // SettleResponse requires `transaction` and `network` even on failure, so
@@ -193,6 +241,73 @@ export function createApp(config, facilitator, rateLimiter) {
         transaction: '',
         network: req.body?.paymentRequirements?.network,
       });
+    }
+  });
+
+  /**
+   * Manual registration, the secondary path.
+   *
+   * Automatic cataloging off the payment path is the primary one — anything
+   * that requires a seller to act after being paid gets skipped.
+   */
+  app.post('/discovery/resources', requireApiKey, async (req, res) => {
+    const body = readPaymentBody(req, res);
+    if (!body) return;
+
+    const check = rateLimiter.checkCatalog(req);
+    if (!check.allowed) return handleRateLimit(res, check);
+
+    const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
+    if (validation.hardDrop) {
+      return res.status(400).json({ error: 'invalid_resource', reason: validation.reason });
+    }
+
+    rateLimiter.recordCatalog(req);
+    try {
+      const entry = await catalog.upsertResource(validation.resource, 'manual');
+      res.json({ ok: true, resource: entry, softDrops: validation.softDrops });
+    } catch (err) {
+      res.status(400).json({ error: 'catalog_error', reason: err.message });
+    }
+  });
+
+  app.get('/discovery/resources', async (req, res) => {
+    let extensions;
+    if (req.query.extensions) {
+      extensions = Array.isArray(req.query.extensions)
+        ? req.query.extensions
+        : req.query.extensions.split(',');
+    }
+
+    const params = {
+      type: req.query.type,
+      payTo: req.query.payTo,
+      scheme: req.query.scheme,
+      network: req.query.network,
+      extensions,
+      limit: req.query.limit,
+      offset: req.query.offset,
+    };
+
+    try {
+      const result = await catalog.listResources(params);
+      let parsedLimit = parseInt(params.limit, 10);
+      if (isNaN(parsedLimit)) parsedLimit = 20;
+
+      let parsedOffset = parseInt(params.offset, 10);
+      if (isNaN(parsedOffset)) parsedOffset = 0;
+
+      res.json({
+        x402Version: 2,
+        items: result.items,
+        pagination: {
+          limit: Math.min(Math.max(1, parsedLimit), 100),
+          offset: Math.max(0, parsedOffset),
+          total: result.total,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: 'internal_error', message: err.message });
     }
   });
 

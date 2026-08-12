@@ -57,6 +57,8 @@ export function stubRateLimiter({ allow = true, reason = 'verify_rpm_exceeded' }
     recorded,
     checkVerify: () => result(),
     checkSettle: () => result(),
+    checkCatalog: () => result(),
+    recordCatalog: req => recorded.push({ name: 'recordCatalog', keyId: req.keyId }),
     recordVerify: req => recorded.push({ name: 'recordVerify', keyId: req.keyId }),
     recordSettle: (req, fee) => recorded.push({ name: 'recordSettle', keyId: req.keyId, fee }),
     getUsage: keyId => ({ keyId, verify: 1, settle: 2, feeStroops: 3000 }),
@@ -69,11 +71,25 @@ export function stubRateLimiter({ allow = true, reason = 'verify_rpm_exceeded' }
  * Port 0 rather than a fixed one: tests must not collide with each other, nor
  * with a facilitator the developer happens to have running.
  */
-export async function serve({ config, facilitator, rateLimiter } = {}) {
+export function stubCatalog(overrides = {}) {
+  const stored = [];
+  return {
+    stored,
+    upsertResource: async (resource, source) => {
+      stored.push({ resource, source });
+      return { ...resource, source };
+    },
+    listResources: async () => ({ items: [], total: 0 }),
+    ...overrides,
+  };
+}
+
+export async function serve({ config, facilitator, rateLimiter, catalog } = {}) {
   const app = createApp(
     config ?? testConfig(),
     facilitator ?? stubFacilitator(),
     rateLimiter ?? stubRateLimiter(),
+    catalog ?? stubCatalog(),
   );
 
   const server = app.listen(0);

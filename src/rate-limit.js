@@ -111,6 +111,16 @@ export class RateLimiter {
     }
   }
 
+  checkCatalog(req) {
+    const key = `catalog:${req.ip}`;
+    return this._checkLimit(key, this.limits.catalog);
+  }
+
+  recordCatalog(req) {
+    const key = `catalog:${req.ip}`;
+    this._increment(key);
+  }
+
   getUsage(keyId) {
     const ownerId = keyId; // IP usage is not exposed via GET /usage, only key usage
     const getCount = (type, windowSec) => {

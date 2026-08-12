@@ -10,7 +10,14 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { serve, testConfig, stubFacilitator, stubRateLimiter, VALID_BODY } from './helpers/app.js';
+import {
+  serve,
+  testConfig,
+  stubFacilitator,
+  stubRateLimiter,
+  stubCatalog,
+  VALID_BODY,
+} from './helpers/app.js';
 
 describe('GET /healthz', () => {
   let app;
@@ -350,6 +357,82 @@ describe('GET /usage', () => {
     const app = await serve({ config: testConfig({ apiKeys: ['admin:s3cret'] }) });
     try {
       assert.equal((await app.get('/usage')).status, 401);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('automatic cataloging', () => {
+  /** Cataloging is enqueued, so give the microtask queue a turn before asserting. */
+  const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+
+  test('a catalog that throws does not fail the payment', async () => {
+    // The claim in the code is that cataloging "must never delay or fail a
+    // payment". Until the surface moved into createApp there was no way to
+    // point a broken catalog at it and find out.
+    const catalog = stubCatalog({
+      upsertResource: async () => {
+        throw new Error('catalog is on fire');
+      },
+    });
+    const app = await serve({ catalog });
+    try {
+      const res = await app.post('/settle', VALID_BODY);
+      assert.equal(res.status, 200);
+      assert.equal((await res.json()).success, true);
+      await settle();
+    } finally {
+      await app.close();
+    }
+  });
+
+  test('a slow catalog does not hold up the payment response', async () => {
+    const catalog = stubCatalog({
+      upsertResource: () => new Promise(resolve => setTimeout(resolve, 2000)),
+    });
+    const app = await serve({ catalog });
+    try {
+      const started = Date.now();
+      const res = await app.post('/settle', VALID_BODY);
+      const elapsed = Date.now() - started;
+      assert.equal(res.status, 200);
+      assert.ok(elapsed < 1000, `payment took ${elapsed}ms; cataloging is on the hot path`);
+    } finally {
+      await app.close();
+    }
+  });
+
+  test('a failed settlement is not catalogued', async () => {
+    // Only a payment that actually happened is evidence a resource is real.
+    const catalog = stubCatalog();
+    const app = await serve({
+      catalog,
+      facilitator: stubFacilitator({
+        settle: async () => ({ success: false, errorReason: 'insufficient_funds' }),
+      }),
+    });
+    try {
+      await app.post('/settle', VALID_BODY);
+      await settle();
+      assert.deepEqual(catalog.stored, []);
+    } finally {
+      await app.close();
+    }
+  });
+
+  test('an invalid verification is not catalogued', async () => {
+    const catalog = stubCatalog();
+    const app = await serve({
+      catalog,
+      facilitator: stubFacilitator({
+        verify: async () => ({ isValid: false, invalidReason: 'expired_payment' }),
+      }),
+    });
+    try {
+      await app.post('/verify', VALID_BODY);
+      await settle();
+      assert.deepEqual(catalog.stored, []);
     } finally {
       await app.close();
     }
