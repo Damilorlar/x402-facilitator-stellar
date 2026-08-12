@@ -16,20 +16,6 @@ export const PUBNET = 'stellar:pubnet';
  * signer secret, because the failure mode of accidentally running a mainnet
  * facilitator with a testnet-shaped config is losing real money.
  */
-export function resolveNetworks(env = process.env) {
-  const networks = [TESTNET];
-  if (env.ENABLE_PUBNET === 'true') {
-    if (!env.FACILITATOR_SECRET_PUBNET) {
-      throw new Error(
-        'ENABLE_PUBNET=true but FACILITATOR_SECRET_PUBNET is unset. ' +
-          'Refusing to serve pubnet with the testnet signer.',
-      );
-    }
-    networks.push(PUBNET);
-  }
-  return networks;
-}
-
 export function resolveConfig(env = process.env) {
   const secret = env.FACILITATOR_SECRET;
   if (!secret) {
@@ -67,19 +53,31 @@ export function resolveConfig(env = process.env) {
     secretPubnet: env.FACILITATOR_SECRET_PUBNET,
     networks: resolveNetworks(env),
 
-    /**
-     * Custom RPC URL. Optional on testnet — @x402/stellar defaults to the
-     * public endpoint. On pubnet a provider URL should be supplied, since the
-     * public endpoint is not something to run an availability target against.
-     */
-    rpcUrl: env.STELLAR_RPC_URL,
+  if (env.ENABLE_PUBNET === 'true') {
+    if (!env.FACILITATOR_SECRET_PUBNET) {
+      throw new Error(
+        'ENABLE_PUBNET=true but FACILITATOR_SECRET_PUBNET is unset. ' +
+          'Refusing to serve pubnet with the testnet signer.',
+      );
+    }
+    if (!env.STELLAR_RPC_URL_PUBNET) {
+      throw new Error(
+        'ENABLE_PUBNET=true but STELLAR_RPC_URL_PUBNET is unset. ' +
+          'Refusing to serve pubnet with the default public endpoint.',
+      );
+    }
+    networks.push(PUBNET);
+    perNetwork[PUBNET] = {
+      secret: env.FACILITATOR_SECRET_PUBNET,
+      rpcUrl: env.STELLAR_RPC_URL_PUBNET,
+      maxTransactionFeeStroops: Number(env.MAX_TX_FEE_STROOPS_PUBNET ?? 50_000),
+    };
+  }
 
-    /**
-     * Fee ceiling the facilitator will pay per settlement, in stroops.
-     * @x402/stellar defaults to 50_000 (0.005 XLM). Configurable rather than
-     * hard-wired, per RFP §3.1.
-     */
-    maxTransactionFeeStroops: Number(env.MAX_TX_FEE_STROOPS ?? 50_000),
+  return {
+    port: Number(env.PORT ?? 3402),
+    networks,
+    perNetwork,
 
     /**
      * Caller authentication. Unset means open, which is correct for a free
