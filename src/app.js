@@ -52,37 +52,55 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
    * payment response returns immediately. A cataloging failure is logged, never
    * surfaced as a payment failure.
    */
-  function enqueueCataloging(req, body, source = 'payment') {
-    // Off the hot path. Cataloging must never delay or fail a payment.
-    Promise.resolve().then(async () => {
-      try {
-        const checkResult = rateLimiter.checkCatalog(req);
-        if (!checkResult.allowed) {
-          console.warn(`[Catalog] Rate limit exceeded for IP ${req.ip}`);
-          return;
-        }
+  function processCataloging(req, body, res, source = 'payment') {
+    const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
+    const outcome = {};
 
-        const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
-        if (validation.hardDrop) {
-          if (validation.reason !== 'missing_or_invalid_discovery_extension') {
-            console.warn(`[Catalog] Hard drop: ${validation.reason}`);
-          }
-          return;
+    if (validation.hardDrop) {
+      if (validation.reason === 'missing_or_invalid_discovery_extension') {
+        outcome.status = 'not attempted';
+      } else {
+        outcome.status = 'rejected';
+        outcome.code = validation.reason;
+        console.warn(`[Catalog] Hard drop: ${validation.reason}`);
+      }
+    } else {
+      const checkResult = rateLimiter.checkCatalog(req);
+      if (!checkResult.allowed) {
+        outcome.status = 'rejected';
+        outcome.code = 'catalog_rate_limited';
+        outcome.reason = checkResult.reason;
+        console.warn(`[Catalog] Rate limit exceeded for IP ${req.ip}`);
+      } else {
+        if (validation.softDrops.length > 0) {
+          outcome.status = 'partially landed';
+          outcome.code = 'catalog_partial';
+          outcome.reason = `Dropped fields: ${validation.softDrops.join(', ')}`;
+          console.warn(
+            `[Catalog] Soft drops for ${validation.resource.url}: ${validation.softDrops.join(', ')}`,
+          );
+        } else {
+          outcome.status = 'landed';
+          outcome.code = 'catalog_success';
         }
 
         rateLimiter.recordCatalog(req);
 
-        if (validation.softDrops.length > 0) {
-          console.warn(
-            `[Catalog] Soft drops for ${validation.resource.url}: ${validation.softDrops.join(', ')}`,
-          );
-        }
-
-        await catalog.upsertResource(validation.resource, source);
-      } catch (err) {
-        console.warn(`[Catalog] Async cataloging failed: ${err.message}`);
+        // Off the hot path. Cataloging must never delay or fail a payment.
+        Promise.resolve().then(async () => {
+          try {
+            await catalog.upsertResource(validation.resource, source);
+          } catch (err) {
+            console.warn(`[Catalog] Async cataloging failed: ${err.message}`);
+          }
+        });
       }
-    });
+    }
+
+    res.setHeader(
+      'EXTENSION-RESPONSES',
+      Buffer.from(JSON.stringify({ bazaar: outcome })).toString('base64'),
+    );
   }
 
   /**
@@ -196,7 +214,7 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
       handleRateLimit(res, check);
       const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
       if (result.isValid) {
-        enqueueCataloging(req, body, 'payment');
+        processCataloging(req, body, res, 'payment');
       }
       res.json(result);
     } catch (err) {
@@ -228,7 +246,7 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
       rateLimiter.recordSettle(req, result.success ? result.transactionFeeStroops || 0 : 0);
       handleRateLimit(res, check);
       if (result.success) {
-        enqueueCataloging(req, body, 'payment');
+        processCataloging(req, body, res, 'payment');
       }
       res.json(result);
     } catch (err) {
@@ -305,6 +323,42 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
           offset: Math.max(0, parsedOffset),
           total: result.total,
         },
+      });
+    } catch (err) {
+      res.status(500).json({ error: 'internal_error', message: err.message });
+    }
+  });
+
+  app.get('/discovery/search', async (req, res) => {
+    if (!req.query.query) {
+      return res.status(400).json({ error: 'invalid_request', reason: 'query is required' });
+    }
+
+    let extensions;
+    if (req.query.extensions) {
+      extensions = Array.isArray(req.query.extensions)
+        ? req.query.extensions
+        : req.query.extensions.split(',');
+    }
+
+    const params = {
+      query: req.query.query,
+      type: req.query.type,
+      payTo: req.query.payTo,
+      scheme: req.query.scheme,
+      network: req.query.network,
+      extensions,
+      limit: req.query.limit,
+      cursor: req.query.cursor,
+    };
+
+    try {
+      const result = await catalog.search(params);
+      res.json({
+        x402Version: 2,
+        resources: result.resources,
+        partialResults: result.partialResults,
+        pagination: result.pagination,
       });
     } catch (err) {
       res.status(500).json({ error: 'internal_error', message: err.message });
