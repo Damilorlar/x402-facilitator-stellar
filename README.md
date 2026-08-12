@@ -107,6 +107,8 @@ stellar keys generate facilitator --network testnet --fund
 
 ### Run locally
 
+**Option A: Node.js**
+
 ```bash
 # 1. Install
 npm install
@@ -117,6 +119,15 @@ export FACILITATOR_SECRET=$(stellar keys show facilitator)
 
 # 3. Serve
 npm start
+```
+
+**Option B: Docker Compose**
+
+For a production-like setup including the database (see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details):
+
+```bash
+export FACILITATOR_SECRET=$(stellar keys show facilitator)
+docker compose up
 ```
 
 ```bash
