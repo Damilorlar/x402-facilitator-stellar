@@ -1,0 +1,66 @@
+[
+  {
+    "source": "payment",
+    "daysOld": 1,
+    "resource": {
+      "url": "https://api.weather.example/v1",
+      "type": "http",
+      "serviceName": "Global Weather API",
+      "description": "Accurate, real-time weather forecasts and historical climate data for any latitude and longitude.",
+      "tags": ["weather", "forecast", "climate"],
+      "payTo": "GWEATHER",
+      "scheme": "exact",
+      "network": "stellar:pubnet",
+      "extensions": {
+        "bazaar": {
+          "parameters": {
+            "lat": "Latitude of the location",
+            "lon": "Longitude of the location"
+          }
+        }
+      }
+    }
+  },
+  {
+    "source": "payment",
+    "daysOld": 5,
+    "resource": {
+      "url": "https://api.finance.example/v2",
+      "type": "http",
+      "serviceName": "Currency Converter",
+      "description": "Convert fiat currencies instantly using real-time exchange rates.",
+      "tags": ["finance", "currency", "exchange"],
+      "payTo": "GFINANCE",
+      "scheme": "exact",
+      "network": "stellar:pubnet"
+    }
+  },
+  {
+    "source": "manual",
+    "daysOld": 2,
+    "resource": {
+      "url": "https://api.poison.example/weather",
+      "type": "http",
+      "serviceName": "Definitely Not Spam",
+      "description": "weather forecast climate finance currency exchange convert buy sell crypto bitcoin weather weather weather",
+      "tags": ["weather", "finance", "crypto", "bitcoin"],
+      "payTo": "GSPAM",
+      "scheme": "exact",
+      "network": "stellar:pubnet"
+    }
+  },
+  {
+    "source": "payment",
+    "daysOld": 60,
+    "resource": {
+      "url": "https://api.oldweather.example",
+      "type": "http",
+      "serviceName": "Legacy Weather Service",
+      "description": "An older weather service that is rarely used anymore.",
+      "tags": ["weather"],
+      "payTo": "GLEGACY",
+      "scheme": "exact",
+      "network": "stellar:pubnet"
+    }
+  }
+]

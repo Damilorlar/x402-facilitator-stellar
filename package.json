@@ -20,7 +20,8 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "licenses": "node scripts/check-licenses.mjs"
+    "licenses": "node scripts/check-licenses.mjs",
+    "eval": "node eval/runner.js"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.2.0",

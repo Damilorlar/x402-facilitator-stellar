@@ -81,3 +81,14 @@ The validation rules for resources submitted to the catalog are as follows:
 - **Rate Limit:** Catalog operations are limited per payer IP to 10 requests per minute (`catalog_rpm` in config).
 - **Resource Cap:** A single `payTo` address can have a maximum of 50 resources in the catalog. New inserts beyond this limit are rejected.
 - **PayTo changes:** If a resource is already cataloged and a subsequent payment reports a different `payTo`, a warning is logged.
+
+## Search Quality & Evaluation History
+
+Search quality is continually measured against a human-authored judgement set (`eval/judgements/queries.json`) and run in CI on every relevant change. Our methodology and its limitations are documented in `eval/judgements/README.md`.
+
+We track the following metrics on our test set:
+
+| Release | Date | P@3 | R@3 | MRR | nDCG | Notes |
+|---------|------|-----|-----|-----|------|-------|
+| `v0.0.1` | 2026-08-12 | 0.625 | 1.000 | 1.000 | 0.991 | Initial lexical baseline release |
+
