@@ -69,6 +69,11 @@ Please refer to our [Documentation Hub](docs/README.md) for detailed role-based 
 - [Buyer / Agent Guide](docs/BUYER.md)
 - [Operator Guide](docs/OPERATOR.md)
 
+### Privacy and Data Minimisation
+
+The X402 Facilitator handles sensitive transaction and search query data. Our approach is to collect only what is necessary, and to aggressively purge it according to strict retention policies.
+For detailed information, see our [Privacy Policy](docs/PRIVACY.md).
+
 ## Conformance
 
 Acceptance is tested at the wire level with stock SDK code, not by reading a claim. What

@@ -28,6 +28,23 @@ export function resolveConfig(env = process.env) {
     throw new Error('FACILITATOR_SECRET must be a Stellar secret key (starts with S).');
   }
 
+  /**
+   * Per-network configuration.
+   *
+   * Signer, RPC endpoint and fee ceiling are all network-specific and are kept
+   * that way deliberately: sharing any of them is how a testnet key ends up
+   * submitting to pubnet, or how a pubnet scheme ends up simulating against a
+   * testnet endpoint.
+   */
+  const networks = [TESTNET];
+  const perNetwork = {
+    [TESTNET]: {
+      secret,
+      rpcUrl: env.STELLAR_RPC_URL,
+      maxTransactionFeeStroops: Number(env.MAX_TX_FEE_STROOPS ?? 50_000),
+    },
+  };
+
   const rawApiKeys = (env.FACILITATOR_API_KEYS ?? '')
     .split(',')
     .map(k => k.trim())
@@ -73,12 +90,6 @@ export function resolveConfig(env = process.env) {
       rateLimits.keys[keyId] = parseLimits(env[k]);
     }
   }
-
-  return {
-    port: Number(env.PORT ?? 3402),
-    secret,
-    secretPubnet: env.FACILITATOR_SECRET_PUBNET,
-    networks: resolveNetworks(env),
 
   if (env.ENABLE_PUBNET === 'true') {
     if (!env.FACILITATOR_SECRET_PUBNET) {
