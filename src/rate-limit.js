@@ -38,11 +38,19 @@ export class RateLimiter {
 
   _check(ownerId, type, windowSec, limit, amount = 1) {
     const bucketId = this._getBucketId(ownerId, type, windowSec);
-    const bucket = this.store.get(bucketId) || { count: 0, resetAt: Math.floor(Date.now() / 1000) + windowSec };
+    const bucket = this.store.get(bucketId) || {
+      count: 0,
+      resetAt: Math.floor(Date.now() / 1000) + windowSec,
+    };
     if (bucket.count + amount > limit) {
       return { allowed: false, limit, remaining: 0, resetAt: bucket.resetAt };
     }
-    return { allowed: true, limit, remaining: limit - bucket.count - amount, resetAt: bucket.resetAt };
+    return {
+      allowed: true,
+      limit,
+      remaining: limit - bucket.count - amount,
+      resetAt: bucket.resetAt,
+    };
   }
 
   _sweep(now) {
@@ -69,18 +77,18 @@ export class RateLimiter {
   checkSettle(req) {
     const ownerId = req.keyId || req.ip;
     const limits = this._getKeyConfig(req.keyId);
-    
+
     // Check all three limits for settle
     const checks = [
       this._check(ownerId, 'settle', 60, limits.settleRpm),
       this._check(ownerId, 'settle', 3600, limits.settleRph),
       this._check(ownerId, 'settle', 86400, limits.settleRpd),
     ];
-    
+
     for (const c of checks) {
       if (!c.allowed) return { ...c, reason: 'rate_limit_exceeded' };
     }
-    
+
     // Check fee limit
     // We can't strictly check fee before settlement unless we assume maxTransactionFeeStroops.
     // We will check if the current consumed + 0 is > limits.feeSpd (or maxTransactionFeeStroops).
@@ -88,8 +96,8 @@ export class RateLimiter {
     if (!feeCheck.allowed) return { ...feeCheck, reason: 'fee_ceiling_exceeded' };
 
     // Return the tightest limit for headers
-    return checks.reduce((tightest, current) => 
-      (current.remaining < tightest.remaining ? current : tightest)
+    return checks.reduce((tightest, current) =>
+      current.remaining < tightest.remaining ? current : tightest,
     );
   }
 

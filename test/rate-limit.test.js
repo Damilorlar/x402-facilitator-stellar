@@ -5,7 +5,7 @@ import { RateLimiter } from '../src/rate-limit.js';
 test('rate limiter honors global limits', () => {
   const config = {
     global: { verifyRpm: 2, settleRpm: 1, settleRph: 10, settleRpd: 100, feeSpd: 1000 },
-    keys: {}
+    keys: {},
   };
   const limiter = new RateLimiter(config);
   const req = { keyId: 'test_key' };
@@ -33,8 +33,8 @@ test('rate limiter honors per-key overrides', () => {
   const config = {
     global: { verifyRpm: 1, settleRpm: 1, settleRph: 10, settleRpd: 100, feeSpd: 1000 },
     keys: {
-      'test_key': { verifyRpm: 5, settleRpm: 1, settleRph: 10, settleRpd: 100, feeSpd: 1000 }
-    }
+      test_key: { verifyRpm: 5, settleRpm: 1, settleRph: 10, settleRpd: 100, feeSpd: 1000 },
+    },
   };
   const limiter = new RateLimiter(config);
   const req = { keyId: 'test_key' };
@@ -47,7 +47,7 @@ test('rate limiter honors per-key overrides', () => {
 test('rate limiter halts on fee ceiling', () => {
   const config = {
     global: { verifyRpm: 10, settleRpm: 10, settleRph: 10, settleRpd: 10, feeSpd: 500 },
-    keys: {}
+    keys: {},
   };
   const limiter = new RateLimiter(config);
   const req = { keyId: 'test_key' };
@@ -55,13 +55,13 @@ test('rate limiter halts on fee ceiling', () => {
   assert.equal(limiter.checkSettle(req).allowed, true);
   limiter.recordSettle(req, 400);
   assert.equal(limiter.checkSettle(req).allowed, true);
-  
+
   // Checking doesn't increment, but if we assume the next transaction could be up to max fee?
   // Our implementation checks if current consumed > limit.
   // Wait, current consumed is 400. limit is 500. So allowed = true.
   // Next settlement consumes 200.
   limiter.recordSettle(req, 200);
-  
+
   // Now consumed is 600. Next check should fail.
   const res = limiter.checkSettle(req);
   assert.equal(res.allowed, false);
@@ -71,7 +71,7 @@ test('rate limiter halts on fee ceiling', () => {
 test('rate limiter falls back to IP in open mode', () => {
   const config = {
     global: { verifyRpm: 1, settleRpm: 1, settleRph: 10, settleRpd: 100, feeSpd: 1000 },
-    keys: {}
+    keys: {},
   };
   const limiter = new RateLimiter(config);
   const req1 = { ip: '192.168.1.1' };
