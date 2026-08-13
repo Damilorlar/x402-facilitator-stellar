@@ -25,6 +25,7 @@
  *   node scripts/fund-testnet-accounts.mjs --github-env # appends to $GITHUB_ENV
  */
 import { appendFileSync } from 'node:fs';
+import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import { Keypair } from '@stellar/stellar-sdk';
 import { installRpcRetry } from '../src/rpc-retry.js';
 
@@ -76,6 +77,56 @@ async function fund(publicKey, label) {
   );
 }
 
+/** Minimal base58 (Bitcoin alphabet) — the encoding Solana keys are given in. */
+function base58Encode(bytes) {
+  const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  let value = 0n;
+  for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+
+  let out = '';
+  while (value > 0n) {
+    out = ALPHABET[Number(value % 58n)] + out;
+    value /= 58n;
+  }
+  // Leading zero bytes are significant and encode as '1'.
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    out = '1' + out;
+  }
+  return out;
+}
+
+/**
+ * The two credentials the harness demands for families it is not running.
+ *
+ * `createE2EClient()` in e2e/clients/typescript/client.ts builds an EVM account
+ * and an SVM signer unconditionally, before any family filter applies — every
+ * other chain, Stellar included, is gated behind an `if (process.env.…)`. So
+ * `--families=stellar` still dies at client startup with
+ * "Cannot read properties of undefined (reading 'slice')" out of viem unless
+ * CLIENT_EVM_PRIVATE_KEY and CLIENT_SVM_PRIVATE_KEY are set.
+ *
+ * These are generated, unfunded and never used: no scenario in a Stellar run
+ * signs with them, and there is nothing on either chain to spend. They exist to
+ * get past a constructor. Funding them, or reusing a real key, would be a
+ * mistake — see docs/CONFORMANCE.md, where this is recorded as an upstream
+ * finding rather than something we should be patching around silently.
+ */
+function unusedForeignFamilyKeys() {
+  // secp256k1: any 32 non-zero bytes is a valid scalar with overwhelming
+  // probability, and viem only needs it to be well-formed.
+  const evm = `0x${randomBytes(32).toString('hex')}`;
+
+  // @solana/kit's createKeyPairSignerFromBytes wants 64 bytes — a 32-byte seed
+  // followed by its public key, and it checks that the two agree — so this has
+  // to be a real ed25519 pair rather than 64 random bytes.
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const seed = privateKey.export({ type: 'pkcs8', format: 'der' }).subarray(-32);
+  const pub = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+
+  return { evm, svm: base58Encode(Buffer.concat([seed, pub])) };
+}
+
 const roles = ['client', 'server', 'facilitator'];
 const keys = Object.fromEntries(roles.map(role => [role, Keypair.random()]));
 
@@ -86,6 +137,8 @@ for (const role of roles) {
   await fund(keys[role].publicKey(), role);
 }
 
+const foreign = unusedForeignFamilyKeys();
+
 const env = {
   // The suite's own names, from e2e/config/mechanisms_stellar.json.
   CLIENT_STELLAR_PRIVATE_KEY: keys.client.secret(),
@@ -94,6 +147,9 @@ const env = {
   // What our own facilitator reads. Deliberately the same key as the one the
   // suite is told about, so the proxy and the service it fronts are one signer.
   FACILITATOR_SECRET: keys.facilitator.secret(),
+  // Unfunded throwaways. See unusedForeignFamilyKeys() above.
+  CLIENT_EVM_PRIVATE_KEY: foreign.evm,
+  CLIENT_SVM_PRIVATE_KEY: foreign.svm,
 };
 
 if (process.argv.includes('--json')) {
@@ -110,7 +166,7 @@ if (process.argv.includes('--json')) {
       .map(([k, v]) => `${k}=${v}`)
       .join('\n') + '\n',
   );
-  console.error('Wrote 4 variables to $GITHUB_ENV');
+  console.error(`Wrote ${Object.keys(env).length} variables to $GITHUB_ENV`);
 } else {
   for (const [k, v] of Object.entries(env)) console.log(`${k}=${v}`);
 }
