@@ -1,0 +1,13 @@
+{
+  "name": "accensa/stellar",
+  "type": "facilitator",
+  "language": "typescript",
+  "protocolFamilies": ["stellar"],
+  "x402Versions": [2],
+  "schemes": ["exact"],
+  "endpoints": [{ "path": "/healthz", "health": true }],
+  "environment": {
+    "required": ["PORT", "FACILITATOR_SECRET"],
+    "optional": ["STELLAR_RPC_URL", "ACCENSA_FACILITATOR_DIR"]
+  }
+}
