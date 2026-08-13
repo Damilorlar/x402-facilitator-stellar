@@ -78,9 +78,37 @@ jobs:
       # servers import. Without it every server dies at startup with
       # "Cannot find module '@x402/express/dist/cjs/index.js'" — which is how the
       # first run of this job failed.
-      - name: Install and build the e2e harness
+      - name: Install the e2e harness
         working-directory: x402/e2e
-        run: pnpm install:all
+        run: pnpm install
+
+      # Split from install, and allowed to fail, because setup.sh builds all
+      # fifteen upstream components and exits non-zero if any one of them fails
+      # — including components on no Stellar code path. On 2026-08-12 a broken
+      # `server/typescript/http/next` build ended this job before a single
+      # scenario ran. Which failures actually matter is decided in the next
+      # step, not by setup.sh's exit code.
+      #
+      # -v because setup.sh swallows all build output without it, and a failure
+      # you cannot read is a failure you cannot report upstream.
+      - name: Build the e2e components
+        id: setup
+        working-directory: x402/e2e
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./setup.sh -v 2>&1 | tee "$GITHUB_WORKSPACE/setup-output.txt"
+
+      # Drops components whose build failed, and fails outright if that would
+      # leave nothing to run or if our own facilitator is the thing that broke.
+      - name: Select the components that built
+        id: select
+        run: |
+          node facilitator/scripts/select-conformance-components.mjs \
+            --e2e-dir="$GITHUB_WORKSPACE/x402/e2e" \
+            --setup-log="$GITHUB_WORKSPACE/setup-output.txt" \
+            --family=stellar \
+            --github-output | tee "$GITHUB_WORKSPACE/component-selection.txt"
 
       # The upstream directory is gitignored, which is the documented place for
       # a facilitator whose implementation does not live in that repository.
@@ -124,7 +152,10 @@ jobs:
           # the run before ours is ever exercised — which is what happened on the
           # first run of this job, and is a fact about the harness rather than
           # evidence about this service.
-          pnpm test --testnet --families=stellar --facilitators=accensa --min -v 2>&1 \
+          pnpm test --testnet --families=stellar --facilitators=accensa \
+            --servers="${{ steps.select.outputs.servers }}" \
+            --clients="${{ steps.select.outputs.clients }}" \
+            --min -v 2>&1 \
             | tee ../../conformance-output.txt
 
       - name: Summarise
@@ -136,8 +167,21 @@ jobs:
             echo "- upstream: \`x402-foundation/x402@${{ steps.upstream.outputs.sha }}\`"
             echo "- facilitator: \`${{ github.sha }}\`"
             echo "- family: stellar · network: testnet · scheme: exact"
+            echo "- servers: \`${{ steps.select.outputs.servers || '(selection did not run)' }}\`"
+            echo "- clients: \`${{ steps.select.outputs.clients || '(selection did not run)' }}\`"
             echo "- result: **${{ steps.run.outcome }}**"
             echo
+            # Exclusions are reported at the top rather than buried in a log.
+            # A conformance run that quietly tested less than it claims to is
+            # the exact failure this job exists to avoid.
+            if [ "${{ steps.select.outputs.excluded_count || 0 }}" -gt 0 ]; then
+              echo "> ⚠️ **${{ steps.select.outputs.excluded_count }} upstream component(s) excluded — build failed in the harness, not on our side:**"
+              echo "> \`${{ steps.select.outputs.excluded }}\`"
+              echo ">"
+              echo "> See the \`conformance-output\` artifact for the build errors, and"
+              echo "> \`docs/CONFORMANCE.md\` for whether it has been filed upstream."
+              echo
+            fi
             echo '```'
             tail -60 conformance-output.txt 2>/dev/null || echo "(no output captured)"
             echo '```'
@@ -148,7 +192,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: conformance-output
-          path: conformance-output.txt
+          # The build log is part of the evidence, not debris: it is where an
+          # excluded component's reason actually lives.
+          path: |
+            conformance-output.txt
+            setup-output.txt
+            component-selection.txt
           if-no-files-found: warn
           retention-days: 90
 
