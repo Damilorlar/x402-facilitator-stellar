@@ -25,8 +25,16 @@
  *   node scripts/fund-testnet-accounts.mjs --github-env # appends to $GITHUB_ENV
  */
 import { appendFileSync } from 'node:fs';
+import { URLSearchParams } from 'node:url';
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
-import { Keypair, Asset, TransactionBuilder, Networks, Account, Operation } from '@stellar/stellar-sdk';
+import {
+  Keypair,
+  Asset,
+  TransactionBuilder,
+  Networks,
+  Account,
+  Operation,
+} from '@stellar/stellar-sdk';
 import { installRpcRetry } from '../src/rpc-retry.js';
 
 // friendbot.stellar.org is behind Cloudflare and advertises AAAA records. On an
@@ -143,7 +151,9 @@ const usdcAsset = new Asset('USDC', USDC_ISSUER);
 console.error('Establishing USDC trustlines...');
 for (const role of roles) {
   const keypair = keys[role];
-  const resAccount = await fetch(`https://horizon-testnet.stellar.org/accounts/${keypair.publicKey()}`);
+  const resAccount = await fetch(
+    `https://horizon-testnet.stellar.org/accounts/${keypair.publicKey()}`,
+  );
   if (!resAccount.ok) throw new Error(`Failed to load account: ${resAccount.status}`);
   const accountData = await resAccount.json();
   const account = new Account(keypair.publicKey(), accountData.sequence);
@@ -152,7 +162,7 @@ for (const role of roles) {
       Operation.changeTrust({
         asset: usdcAsset,
         limit: '1000000000',
-      })
+      }),
     )
     .setTimeout(30)
     .build();
@@ -162,7 +172,7 @@ for (const role of roles) {
   body.append('tx', tx.toXDR());
   const res = await fetch('https://horizon-testnet.stellar.org/transactions', {
     method: 'POST',
-    body
+    body,
   });
   if (!res.ok) {
     const errorBody = await res.text();
