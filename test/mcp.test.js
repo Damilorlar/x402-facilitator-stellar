@@ -11,6 +11,7 @@ function createMcpClient(env) {
     env: { ...process.env, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  child.stderr.on('data', d => process.stderr.write(d));
 
   let messageId = 1;
   const pending = new Map();
@@ -40,6 +41,13 @@ function createMcpClient(env) {
     }
   });
 
+  child.on('exit', (code) => {
+    for (const { reject } of pending.values()) {
+      reject(new Error(`Child exited with code ${code}`));
+    }
+    pending.clear();
+  });
+
   return {
     callTool: (name, args) => {
       return new Promise((resolve, reject) => {
@@ -62,7 +70,7 @@ function createMcpClient(env) {
 
 test('MCP Server Spending Controls', async t => {
   const client = createMcpClient({
-    AGENT_PAYER_SECRET_KEY: 'SBUVX4M65C5HHKO2J75Y7EGBYJ2UHY4ZIVW5JDFOYY6AUPXUKOIMXG4T', // valid testnet key
+    AGENT_PAYER_SECRET_KEY: 'SBTJBX7IF3W4IU2VRQXK2PPEAQJW5PZTRUQPL4CVIBEL42OE3YLETWWW', // valid testnet key
     MAX_FEE_PER_CALL_STROOPS: '500',
     MAX_SESSION_SPEND_STROOPS: '1000',
   });
@@ -82,6 +90,7 @@ test('MCP Server Spending Controls', async t => {
       res.end(
         JSON.stringify({
           error: 'payment_required',
+          x402Version: 1,
           accepts: [
             {
               scheme: 'exact',
@@ -99,6 +108,7 @@ test('MCP Server Spending Controls', async t => {
       res.end(
         JSON.stringify({
           error: 'payment_required',
+          x402Version: 1,
           accepts: [
             {
               scheme: 'exact',
@@ -121,12 +131,12 @@ test('MCP Server Spending Controls', async t => {
 
   await t.test('enforces per-call cap (600 > 500)', async () => {
     try {
+      console.log('Sending call_paid_resource...');
       await client.callTool('call_paid_resource', { url: url600 });
-      // The tool result itself has isError: true when error is handled.
-      // Wait, in my server implementation, if err.isToolError is true, it returns isError: true.
-      // But my errors are standard Error, so they go to _sendError and reject!
+      console.log('Received response from call_paid_resource, failing test');
       assert.fail('Should have rejected');
     } catch (err) {
+      console.log('Caught error:', err.message);
       assert.match(err.message, /Spending refused.*exceeds per-call limit/);
     }
   });
