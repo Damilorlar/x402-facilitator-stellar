@@ -188,6 +188,10 @@ const env = {
   // The suite's own names, from e2e/config/mechanisms_stellar.json.
   CLIENT_STELLAR_PRIVATE_KEY: keys.client.secret(),
   SERVER_STELLAR_ADDRESS: keys.server.publicKey(),
+  // Not an upstream variable, and deliberately not written into the harness's
+  // .env: the payee's secret is needed only so scripts/prepare-testnet-usdc.mjs
+  // can give it a USDC trustline, without which it cannot receive the payment.
+  SERVER_STELLAR_PRIVATE_KEY: keys.server.secret(),
   FACILITATOR_STELLAR_PRIVATE_KEY: keys.facilitator.secret(),
   // What our own facilitator reads. Deliberately the same key as the one the
   // suite is told about, so the proxy and the service it fronts are one signer.

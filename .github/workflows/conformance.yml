@@ -160,9 +160,28 @@ jobs:
           # Prove the file was written without printing key material.
           echo "wrote $(wc -l < .env) variables"
 
+      # The $0.001 route is priced in USDC, not XLM, so friendbot funding alone
+      # leaves the payer with no trustline and no balance and every scenario
+      # dies in simulation with Error(Contract, #13). Trustlines are free and
+      # created here; the balance needs a pre-funded treasury, because nobody
+      # can mint Circle's testnet USDC on demand.
+      #
+      # TESTNET_USDC_TREASURY_SECRET is a TESTNET-ONLY key. There is no pubnet
+      # path in that script and no pubnet secret is available to this job.
+      - name: Give the payer and payee testnet USDC
+        id: usdc
+        working-directory: facilitator
+        env:
+          TESTNET_USDC_TREASURY_SECRET: ${{ secrets.TESTNET_USDC_TREASURY_SECRET }}
+        run: node scripts/prepare-testnet-usdc.mjs --github-output
+
       - name: Run the upstream suite against this facilitator
         id: run
         working-directory: x402/e2e
+        # Skipped, rather than run and failed, when the payer cannot hold the
+        # asset: that is a missing prerequisite on our side, and reporting it as
+        # a conformance failure would misattribute it to the service.
+        if: steps.usdc.outputs.usdc_ready == 'true'
         continue-on-error: true
         run: |
           set -o pipefail
@@ -188,8 +207,17 @@ jobs:
             echo "- family: stellar · network: testnet · scheme: exact"
             echo "- servers: \`${{ steps.select.outputs.servers || '(selection did not run)' }}\`"
             echo "- clients: \`${{ steps.select.outputs.clients || '(selection did not run)' }}\`"
-            echo "- result: **${{ steps.run.outcome }}**"
+            echo "- result: **${{ steps.run.outcome == 'skipped' && 'not attempted' || steps.run.outcome }}**"
             echo
+            if [ "${{ steps.usdc.outputs.usdc_ready }}" != "true" ]; then
+              echo "> ⛔ **The suite was not run.** The payer could not be given the USDC the"
+              echo "> \`/exact/stellar\` route is priced in:"
+              echo ">"
+              echo "> ${{ steps.usdc.outputs.usdc_reason }}"
+              echo ">"
+              echo "> This is a missing prerequisite on our side, not a conformance result."
+              echo
+            fi
             # Exclusions are reported at the top rather than buried in a log.
             # A conformance run that quietly tested less than it claims to is
             # the exact failure this job exists to avoid.
