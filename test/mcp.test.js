@@ -41,7 +41,7 @@ function createMcpClient(env) {
     }
   });
 
-  child.on('exit', (code) => {
+  child.on('exit', code => {
     for (const { reject } of pending.values()) {
       reject(new Error(`Child exited with code ${code}`));
     }
