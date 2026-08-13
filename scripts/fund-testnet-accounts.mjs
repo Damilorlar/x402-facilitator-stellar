@@ -26,7 +26,7 @@
  */
 import { appendFileSync } from 'node:fs';
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
-import { Keypair } from '@stellar/stellar-sdk';
+import { Keypair, Asset, TransactionBuilder, Networks, Account, Operation } from '@stellar/stellar-sdk';
 import { installRpcRetry } from '../src/rpc-retry.js';
 
 // friendbot.stellar.org is behind Cloudflare and advertises AAAA records. On an
@@ -135,6 +135,41 @@ console.error(`Funding three testnet accounts via ${FRIENDBOT}`);
 // not worth the flakiness that concurrency buys here.
 for (const role of roles) {
   await fund(keys[role].publicKey(), role);
+}
+
+const USDC_ISSUER = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+const usdcAsset = new Asset('USDC', USDC_ISSUER);
+
+console.error('Establishing USDC trustlines...');
+for (const role of roles) {
+  const keypair = keys[role];
+  const resAccount = await fetch(`https://horizon-testnet.stellar.org/accounts/${keypair.publicKey()}`);
+  if (!resAccount.ok) throw new Error(`Failed to load account: ${resAccount.status}`);
+  const accountData = await resAccount.json();
+  const account = new Account(keypair.publicKey(), accountData.sequence);
+  const tx = new TransactionBuilder(account, { fee: '1000', networkPassphrase: Networks.TESTNET })
+    .addOperation(
+      Operation.changeTrust({
+        asset: usdcAsset,
+        limit: '1000000000',
+      })
+    )
+    .setTimeout(30)
+    .build();
+  tx.sign(keypair);
+
+  const body = new URLSearchParams();
+  body.append('tx', tx.toXDR());
+  const res = await fetch('https://horizon-testnet.stellar.org/transactions', {
+    method: 'POST',
+    body
+  });
+  if (!res.ok) {
+    const errorBody = await res.text();
+    throw new Error(`Failed to submit transaction: ${res.status} ${errorBody}`);
+  }
+
+  console.error(`  trusted USDC on ${role.padEnd(11)} ${keypair.publicKey()}`);
 }
 
 const foreign = unusedForeignFamilyKeys();
