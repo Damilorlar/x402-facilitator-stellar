@@ -73,11 +73,25 @@ jobs:
       - name: Install uv (needed by the harness setup for python components)
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
-      # `pnpm install` is NOT enough. install:all is `pnpm install && ./setup.sh`,
-      # and setup.sh is what builds the workspace @x402/* packages the spawned
-      # servers import. Without it every server dies at startup with
-      # "Cannot find module '@x402/express/dist/cjs/index.js'" — which is how the
-      # first run of this job failed.
+      # The SDK monorepo has to be built before the harness, and upstream's own
+      # instructions do not say so. e2e/pnpm-workspace.yaml pulls in
+      # `../typescript/packages/*` as workspace packages, so `pnpm install`
+      # symlinks them — but nothing builds them, and every spawned server
+      # imports `@x402/<adapter>/dist/cjs/index.js`. Without this step each
+      # server dies at startup with MODULE_NOT_FOUND on a path inside
+      # `e2e/servers/typescript/node_modules/@x402/…`, which reads like a
+      # missing dependency and is really an unbuilt one.
+      #
+      # Everything is built rather than a filtered subset: servers/typescript
+      # declares a workspace dependency on all eighteen @x402/* packages and
+      # registers schemes for them at boot, so a filtered build just moves the
+      # same failure to whichever package the filter missed.
+      - name: Build the @x402/* workspace packages
+        working-directory: x402/typescript
+        run: |
+          pnpm install
+          pnpm build
+
       - name: Install the e2e harness
         working-directory: x402/e2e
         run: pnpm install
