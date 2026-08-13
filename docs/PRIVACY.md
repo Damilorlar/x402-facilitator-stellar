@@ -6,10 +6,10 @@ This document outlines our approach to user tracking, data minimisation, and dat
 
 Data collection is strictly scoped by subsystem:
 
-- **Request Logs**: We collect timestamps, endpoint paths, response status codes, and latency metrics. IP addresses are used only transiently for rate limiting.
-- **Settlement Records**: For successful settlements, we store transaction identifiers (hashes), amounts, seller endpoints, and the payer's Stellar account ID necessary for refund routing.
+- **Request Logs**: We collect timestamps, endpoint paths, response status codes, and latency metrics. IP addresses are used only transiently for rate limiting. *(Note: Request logging is not yet implemented. See [Issue #7](https://github.com/accensa/x402-facilitator-stellar/issues/7))*
+- **Settlement Records**: For successful settlements, we store transaction identifiers (hashes), amounts, seller endpoints, and the payer's Stellar account ID necessary for refund routing. *(Note: Durable storage of settlement records is not yet implemented. See [Issue #10](https://github.com/accensa/x402-facilitator-stellar/issues/10))*
 - **Catalog Entries (The Bazaar)**: Seller endpoints, offered resources, prices, and descriptive metadata as submitted by the seller.
-- **Search Queries**: Search terms used in the Bazaar are recorded for query evaluation and quality improvement (hybrid search ranking).
+- **Search Queries**: Search terms used in the Bazaar are recorded for query evaluation and quality improvement (hybrid search ranking). *(Note: Search query collection is not yet implemented. See [Issue #25](https://github.com/accensa/x402-facilitator-stellar/issues/25))*
 - **Usage Counters**: Aggregated metrics on request volumes, settlement success rates, and active seller counts.
 
 ## 2. What is Deliberately Not Collected
@@ -29,6 +29,8 @@ Search queries submitted to the Bazaar are highly sensitive as they reveal user 
 - Queries are aggregated and anonymized before being used for any search tuning.
 - All raw query data is subject to our strict 30-day retention policy.
 
+*(Note: Search query retention and anonymization controls are pending the implementation of query collection. See [Issue #50](https://github.com/accensa/x402-facilitator-stellar/issues/50) and [Issue #25](https://github.com/accensa/x402-facilitator-stellar/issues/25))*
+
 ## 4. The Public Catalog Tension
 
 The Bazaar acts as a **public catalog**. When a seller registers their endpoint and pricing, this metadata is intentionally published and indexed to allow buyers to discover resources. 
@@ -44,6 +46,8 @@ Operator access to settlement and query data is strictly limited:
 - Only authorized operators have read access to the production database for debugging and support purposes.
 - All access to this data is logged and periodically audited.
 
+*(Note: The production database and access audit logging are not yet implemented. See [Issue #10](https://github.com/accensa/x402-facilitator-stellar/issues/10) and [Issue #50](https://github.com/accensa/x402-facilitator-stellar/issues/50))*
+
 ## 6. Self-Hosting as the Privacy Answer
 
 If an operator or a consortium does not wish to share this data with our hosted instance, **self-hosting is a fully supported alternative**. 
@@ -58,4 +62,4 @@ We adhere to the following retention periods:
 
 ### Enforcement
 
-These retention periods are enforced by an automated deletion job (`scripts/data_retention_job.js`) that runs daily to purge expired records from our datastores.
+These retention periods represent the policy the service commits to. The automated deletion job (`scripts/data_retention_job.js`) to enforce these periods is not yet implemented. This work is currently tracked in [Issue #50](https://github.com/accensa/x402-facilitator-stellar/issues/50).
