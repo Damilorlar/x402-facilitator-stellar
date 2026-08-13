@@ -98,7 +98,7 @@ jobs:
       - run: npm ci
       # Search evaluation gate
       - run: npm run eval
-  
+
   examples:
     name: examples
     runs-on: ubuntu-latest
@@ -121,4 +121,3 @@ jobs:
           node -e "import('./index.js').catch(e => { console.error(e); process.exit(1); })" &
           sleep 5
           kill %1
-
