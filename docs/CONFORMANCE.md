@@ -122,6 +122,91 @@ about this service.
 
 ## 4. Results
 
+### 2026-08-14 — first payments settled on testnet; 1 of 5 server components passes
+
+The previous section closed by saying this one would be written with the first
+real result, pass or fail. It is both.
+
+**Two runs, `71743e1` against upstream `main`, twelve minutes apart.** Each
+settled exactly one payment on Stellar testnet, and each failed four scenarios.
+
+#### What passed — and it is the headline claim of this repository
+
+An **unmodified canonical client** (`typescript/http/fetch`) requested a
+paywalled route, received a `402` with terms, signed a payment authorization,
+retried, and this facilitator verified it and settled it on-chain. The fee was
+paid by the facilitator's own account, so `areFeesSponsored` is not just
+advertised in `/supported` — it is what happened.
+
+| Run | Transaction | Ledger | Settled |
+|---|---|---|---|
+| 1 | [`5f1bd15a…5558`](https://stellar.expert/explorer/testnet/tx/5f1bd15aec8ca3c6390689ed7fed82506f6c3d8eb8ed325a05a8b83974925558) | 4134781 | 2026-08-14T08:15:33Z |
+| 2 | [`ff798145…0590`](https://stellar.expert/explorer/testnet/tx/ff798145681ad66e20f39f60d91895e993bc8033bbc78847aa5ddf0ee1e70590) | 4134928 | 2026-08-14T08:27:49Z |
+
+Both return `"successful": true` from Horizon. Check them yourself:
+
+```bash
+curl -s https://horizon-testnet.stellar.org/transactions/5f1bd15aec8ca3c6390689ed7fed82506f6c3d8eb8ed325a05a8b83974925558 \
+  | jq '{successful, ledger, created_at}'
+```
+
+#### What failed — four of five, and it is structural
+
+| Server component | Run 1 | Run 2 | Failure |
+|---|---|---|---|
+| `typescript/http/next` | ✅ (5th) | ✅ (3rd) | — |
+| `typescript/http/express` | ❌ | ❌ | `Payment response header not found` |
+| `typescript/http/fastify` | ❌ | ❌ | `Payment response header not found` |
+| `typescript/http/hono` | ❌ | ❌ | `402 facilitator_error` |
+| `typescript/mcp` | ❌ | ❌ | `402 facilitator_error` |
+
+The two runs are reported together because the harness ordered the combinations
+differently in each, and that difference is the only useful control available.
+`next` passed from position 5 and again from position 3, while the same four
+failed in both. **So this is not flakiness, not USDC propagation lag, and not
+the treasury draining** — the first hypothesis after run 1 was that only the
+last combination passed because the payer's balance needed time to propagate,
+and run 2 disproves it.
+
+Exactly one settlement occurs per run, so the four failures never reached the
+chain at all. The one structural difference visible from outside is the route:
+`next` is exercised at `/api/exact/stellar/withX402`, the other four at
+`/exact/stellar` and `exact_stellar`.
+
+#### Why this cannot be diagnosed further today
+
+The facilitator produced **four lines of output across an entire run** — three
+startup banners and an exit code:
+
+```
+[facilitators/external-proxies/accensa] stdout: x402 Stellar facilitator listening on :4027
+[facilitators/external-proxies/accensa] stdout:   networks : stellar:testnet
+[facilitators/external-proxies/accensa] stdout: Facilitator listening on :4027
+[facilitators/external-proxies/accensa] Process exited with code 143
+```
+
+No request log, no verify or settle outcome, no rejection reason. Two of the
+four failures return upstream's `facilitator_error`, which means *this service
+returned an error* — and there is no record of what it was. Whether the other
+two are ours or upstream's is likewise unknowable from here.
+
+That makes [#7](https://github.com/accensa/x402-facilitator-stellar/issues/7)
+(structured logging, request correlation, `/metrics`) the blocking item for this
+document, not a nice-to-have. It is tracked against these runs in
+[#64](https://github.com/accensa/x402-facilitator-stellar/issues/64).
+
+#### A Bazaar finding, on the passing scenario
+
+```
+[Catalog] Hard drop: invalid_routeTemplate
+[x402] extension responses: {"bazaar":{"status":"rejected","code":"invalid_routeTemplate"}}
+```
+
+Upstream's server registers wildcard `*` route templates; this repo's catalog
+validation hard-drops them. This is the **first time another party's client has
+touched this catalog**, and the listing was rejected. Filed as
+[#65](https://github.com/accensa/x402-facilitator-stellar/issues/65).
+
 ### 2026-08-12 — integration verified, payment path not yet exercised
 
 Run locally against `x402-foundation/x402@main`, Stellar family, testnet.
@@ -181,17 +266,21 @@ its first result — pass or fail.
 
 ### Acceptance items
 
+Current as of 2026-08-14.
+
 | Item | State | Evidence |
 |---|---|---|
-| Canonical client completes a payment, testnet | ⬜ | pending first CI run |
+| Canonical client completes a payment, testnet | ✅ | [`5f1bd15a…`](https://stellar.expert/explorer/testnet/tx/5f1bd15aec8ca3c6390689ed7fed82506f6c3d8eb8ed325a05a8b83974925558) and [`ff798145…`](https://stellar.expert/explorer/testnet/tx/ff798145681ad66e20f39f60d91895e993bc8033bbc78847aa5ddf0ee1e70590), both `successful` on Horizon |
 | Canonical client completes a payment, pubnet | ⬜ | blocked on #17 |
-| `/supported` emits `extra.areFeesSponsored` | ✅ | asserted by `test/app.test.js`; visible in the boot output above |
+| `/supported` emits `extra.areFeesSponsored` | ✅ | `test/app.test.js`; and observed — the facilitator paid the fee on both settlements above |
 | `payload: {transaction}` accepted verbatim | ✅ | `test/app.test.js` |
-| Upstream e2e suite, testnet | 🟡 | facilitator accepted and healthy; payment path pending |
+| Upstream e2e suite, testnet | 🟡 | **1 of 5 server components passes.** `next` ✅; `express`, `fastify`, `hono`, `mcp` ❌ — reproducible across two runs, see above and #64 |
 | Upstream e2e suite, pubnet | ⬜ | blocked on #17 |
 | Non-null reason on every rejection | ✅ | `test/app.test.js`, across four malformed-body shapes on both routes |
-| Settled tx hash published per network per scheme | ⬜ | #18 |
+| Settled tx hash published per network per scheme | 🟡 | testnet `exact` published above; pubnet blocked on #17. #18 |
+| Bazaar listing accepted by a third-party client | ❌ | first attempt rejected `invalid_routeTemplate`, #65 |
 | `__check_auth` smart-account payer | ⬜ | #13 |
+| Structured logs sufficient to diagnose a failure | ❌ | four lines per run; #7, blocking #64 |
 
 ## 5. Automation
 
