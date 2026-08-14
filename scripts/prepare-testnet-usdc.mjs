@@ -19,8 +19,8 @@
  *   2. A USDC BALANCE on the payer. Nobody can mint Circle's testnet USDC on
  *      demand; it comes from Circle's faucet, which is a human with a browser.
  *      So this needs a pre-funded treasury account, supplied as
- *      TESTNET_USDC_TREASURY_SECRET, that dribbles out a fraction of a cent per
- *      run.
+ *      TESTNET_USDC_TREASURY_SECRET, that dribbles out a cent per run — see
+ *      PER_RUN_AMOUNT for why that figure is the real burn rate.
  *
  * ON THE TREASURY SECRET. Issue #14 asks for friendbot-funded fresh accounts
  * over stored keys, and everything that *can* be ephemeral still is: payer,
@@ -61,9 +61,16 @@ const HORIZON = process.env.HORIZON_URL ?? 'https://horizon-testnet.stellar.org'
 const USDC_ISSUER = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 const EXPECTED_SAC = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA';
 
-// One run spends $0.001. This is three orders of magnitude more, so a treasury
-// funded once from the faucet outlives any reasonable schedule.
-const PER_RUN_AMOUNT = '1.0000000';
+// One run spends $0.001 on the `/exact/stellar` route. This is 10x that, which
+// leaves room for a scenario that pays more than once without being so much
+// that the treasury drains on a schedule.
+//
+// The payer is a fresh keypair every run and is never swept, so whatever is sent
+// here is stranded once the run ends — this figure is the true per-run burn, not
+// a float. At 0.01 a single faucet pull of 20 USDC funds ~2,000 runs, which is
+// over five years of the daily cron. At the previous 1.0 it was 20 runs, or
+// under three weeks, and topping up needs a human at Circle's faucet.
+const PER_RUN_AMOUNT = '0.0100000';
 const TRUSTLINE_LIMIT = '1000000';
 
 const usdc = new Asset('USDC', USDC_ISSUER);
