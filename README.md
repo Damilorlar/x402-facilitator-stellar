@@ -26,10 +26,10 @@
 > [!WARNING]
 > **This is a conformance spike, not a production facilitator.** It exists to answer one
 > question: can an unmodified canonical x402 client complete a payment against a
-> facilitator we operate on Stellar testnet? **That question is still open** — see
-> [Conformance](#conformance) for exactly which boxes are unticked and why. It makes no
-> availability claim, is not deployed anywhere you can reach, and has published no settled
-> transaction hash.
+> facilitator we operate on Stellar testnet? **As of 2026-08-14 the answer is yes, twice,
+> with settled transactions anyone can verify** — and **four of the five upstream server
+> components still fail**. See [Conformance](#conformance) for both halves. It makes no
+> availability claim and is not deployed anywhere you can reach.
 
 ## The Problem
 
@@ -123,29 +123,46 @@ holds today on testnet:
 - [x] Every rejection carries a non-null `invalidReason` — across malformed bodies,
       unregistered scheme/network pairs, and scheme-level failures
 - [x] The spec's `payload: {transaction}` shape is accepted verbatim
-- [ ] An unmodified canonical client completes a payment end-to-end
-- [ ] Settled transaction hash published
+- [x] **An unmodified canonical client completes a payment end-to-end**
+- [x] **Settled transaction hash published** — two, below
+- [ ] The x402 repository's e2e suite — **1 of 5 server components passes**
 - [ ] `stellar:pubnet`
-- [ ] The x402 repository's e2e suite
 
-**Why the last four are unticked, stated rather than left vague.** The
-[conformance workflow](.github/workflows/conformance.yml) runs the upstream
-`x402-foundation/x402` e2e suite against this facilitator daily. It has run three times
-and passed zero scenarios. The blocker is not this service: `@x402/stellar` resolves the
-route's `$0.001` price to Circle's testnet USDC, friendbot funds XLM only, and Circle's
-testnet USDC cannot be minted on demand — so every buyer reaches the payment and fails in
-simulation with an empty balance:
+### Settled on Stellar testnet, 2026-08-14
 
+An unmodified `typescript/http/fetch` client received a `402` with terms, signed a payment
+authorization, retried, and this facilitator verified and settled it on-chain — paying the
+network fee itself, so `areFeesSponsored` is observed rather than merely advertised.
+
+| Transaction | Ledger | Settled |
+|---|---|---|
+| [`5f1bd15a…5558`](https://stellar.expert/explorer/testnet/tx/5f1bd15aec8ca3c6390689ed7fed82506f6c3d8eb8ed325a05a8b83974925558) | 4134781 | 08:15:33Z |
+| [`ff798145…0590`](https://stellar.expert/explorer/testnet/tx/ff798145681ad66e20f39f60d91895e993bc8033bbc78847aa5ddf0ee1e70590) | 4134928 | 08:27:49Z |
+
+Both report `"successful": true` from Horizon. Verify without trusting this file:
+
+```bash
+curl -s https://horizon-testnet.stellar.org/transactions/5f1bd15aec8ca3c6390689ed7fed82506f6c3d8eb8ed325a05a8b83974925558 \
+  | jq '{successful, ledger, created_at}'
 ```
-HostError: Error(Contract, #10) "resulting balance is not within the allowed range", 0, -10000
-```
 
-Trustlines are now created for payer and payee automatically. A *balance* needs a
-pre-funded testnet treasury key supplied as the `TESTNET_USDC_TREASURY_SECRET` repository
-secret. Without it the job reports `usdc_ready=false` and **skips the suite rather than
-running a matrix that can only fail** — a missing faucet is a prerequisite gap, not a
-conformance result about this service. Until that secret exists, treat every box above as
-unproven, and see [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md).
+### Four of five scenarios still fail
+
+`typescript/http/next` passes. `express`, `fastify`, `hono` and `mcp` do not — two with
+`Payment response header not found`, two with upstream's `402 facilitator_error`. This
+reproduced identically across two runs in which the harness ordered the combinations
+differently, so it is **structural rather than flaky**. Exactly one settlement occurs per
+run; the four failures never reach the chain.
+
+**It cannot currently be diagnosed**, because this facilitator emits four lines of output
+across an entire run — three startup banners and an exit code. Two of the failures mean
+*this service returned an error*, and there is no record of what it was. That makes
+[#7](https://github.com/accensa/x402-facilitator-stellar/issues/7) the blocking item
+rather than a nice-to-have; the investigation is
+[#64](https://github.com/accensa/x402-facilitator-stellar/issues/64).
+
+The full record, including the treasury prerequisite that had to be solved first and how
+to reproduce both results, is in [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md).
 
 Responses use the canonical field names — `VerifyResponse` carries `invalidReason` and
 `invalidMessage`; `SettleResponse` carries `errorReason`, `errorMessage`, `transaction`
@@ -164,8 +181,11 @@ correct locally and is non-conformant on the wire.
   `GET /discovery/resources` with the full upstream filter set, `GET /discovery/search`
   with lexical and hybrid (dense-embedding + reranking) retrieval, automatic cataloging
   off the payment path, `EXTENSION-RESPONSES` reporting, and an MCP server
-  ([`docs/MCP.md`](docs/MCP.md)). What has *not* happened is any other party's client
-  reading this catalog. A search-evaluation harness and judgement set live in `eval/`.
+  ([`docs/MCP.md`](docs/MCP.md)). A search-evaluation harness and judgement set live in
+  `eval/`. **On 2026-08-14 another party's client read this catalog for the first time
+  and its listing was rejected** — upstream registers wildcard `*` route templates and
+  this repo's validation hard-drops them as `invalid_routeTemplate`
+  ([#65](https://github.com/accensa/x402-facilitator-stellar/issues/65)).
 - **No deployment.** There is a `Dockerfile`, a `docker-compose.yml` and
   [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), but no instance is running at a URL anyone
   can hit. Availability targets and a status page are tracked in
