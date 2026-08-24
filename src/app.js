@@ -25,6 +25,8 @@ import express from 'express';
 import { validateForCatalog } from './catalog/validation.js';
 import { createAuditLogger } from './audit.js';
 import { createReadinessChecker } from './readiness.js';
+import { validatePaymentBody } from './request-validation.js';
+import { requestLogger } from './logger.js';
 
 /**
  * Builds the Express app.
@@ -49,15 +51,20 @@ import { createReadinessChecker } from './readiness.js';
 export function createApp(config, facilitator, rateLimiter, catalog, extras = {}) {
   const app = express();
   app.use(express.json({ limit: '256kb' }));
+  // Redacts Authorization/cookie/*_secret before anything hits the log — see
+  // src/logger.js. Never logs the body: paymentPayload/paymentRequirements
+  // are validated, not logged, transport-wide.
+  app.use(requestLogger());
 
   const audit = extras.audit ?? createAuditLogger();
 
-  // Readiness defaults to a real checker over the resolved config. A bare test
-  // config carries no networks, in which case the probe reports honestly that
-  // it has nothing to check rather than pretending to be ready.
+  // Readiness defaults to a real checker over the resolved config. A bare
+  // config (tests) carries no per-network signer/RPC data, in which case the
+  // probe reports honestly that it has nothing to check rather than pretending
+  // to be ready.
   const readiness =
     extras.readiness ??
-    (Array.isArray(config.networks)
+    (Array.isArray(config.networks) && config.perNetwork
       ? createReadinessChecker(config, {
           breakerStates: extras.breakerStates ?? (() => null),
           catalog,
@@ -228,18 +235,36 @@ export function createApp(config, facilitator, rateLimiter, catalog, extras = {}
    * Both /verify and /settle take {paymentPayload, paymentRequirements}.
    * Returning a non-null reason on a malformed body matters as much as on a
    * failed verification — a null reason anywhere is an acceptance failure.
+   *
+   * Validation itself lives in request-validation.js: this only shapes the
+   * rejection into the response the calling route would otherwise have sent,
+   * since /verify and /settle disagree on what a failure body looks like
+   * (isValid/invalidReason vs. success/errorReason/transaction/network).
    */
-  function readPaymentBody(req, res) {
-    const { paymentPayload, paymentRequirements } = req.body ?? {};
-    if (!paymentPayload || !paymentRequirements) {
-      res.status(400).json({
-        isValid: false,
-        invalidReason: 'invalid_request',
-        invalidMessage: 'body must contain paymentPayload and paymentRequirements',
-      });
+  function readPaymentBody(req, res, route = 'verify') {
+    const result = validatePaymentBody(req.body, config);
+    if (!result.valid) {
+      if (route === 'settle') {
+        res.status(400).json({
+          success: false,
+          errorReason: result.reason,
+          errorMessage: result.message,
+          transaction: '',
+          network: req.body?.paymentRequirements?.network,
+        });
+      } else {
+        res.status(400).json({
+          isValid: false,
+          invalidReason: result.reason,
+          invalidMessage: result.message,
+        });
+      }
       return null;
     }
-    return { paymentPayload, paymentRequirements };
+    return {
+      paymentPayload: result.paymentPayload,
+      paymentRequirements: result.paymentRequirements,
+    };
   }
 
   app.get('/healthz', (_req, res) => res.json({ ok: true }));
@@ -327,7 +352,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, extras = {}
     const check = await rateLimiter.checkSettle(req);
     if (!check.allowed) return rejectRateLimited(req, res, '/settle', check);
 
-    const body = readPaymentBody(req, res);
+    const body = readPaymentBody(req, res, 'settle');
     if (!body) return;
     try {
       const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);

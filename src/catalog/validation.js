@@ -7,6 +7,24 @@ import {
   validateDiscoveryExtension,
 } from '@x402/extensions';
 
+/**
+ * Distinguishes a hostile routeTemplate (path traversal, protocol smuggling,
+ * unparseable percent-encoding) from one that is merely low-quality, such as
+ * the wildcard ("*") pattern upstream's own SDK registers by default. Both
+ * fail isValidRouteTemplate() identically, but only the former is a security
+ * boundary worth discarding the whole resource over — see #65.
+ */
+function isHostileRouteTemplate(value) {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  let decoded;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    return true;
+  }
+  return decoded.includes('..') || decoded.includes('://');
+}
+
 export function validateForCatalog(paymentPayload, paymentRequirements) {
   const result = {
     hardDrop: false,
@@ -36,13 +54,28 @@ export function validateForCatalog(paymentPayload, paymentRequirements) {
   }
 
   // 2. routeTemplate validation
+  //
+  // Path traversal and protocol smuggling stay a hard drop — that is a real
+  // security boundary (SSRF / traversal), not a quality issue. But a wildcard
+  // ("*") route is low-quality discovery metadata, not a malformed or hostile
+  // one: upstream's own SDK registers it by default and warns that it
+  // degrades to auto-generated parameter names (var1, var2, ...) rather than
+  // refusing to emit it. Hard-dropping the whole resource over that punishes
+  // a seller for the stock SDK's defaults, so this is a soft drop instead —
+  // the resource still lands, without the routeTemplate (extractDiscoveryInfo
+  // above already leaves it undefined and falls back to the payment's own
+  // resource URL), and the quality issue is surfaced via
+  // softDrops/EXTENSION-RESPONSES so the seller can improve it. See #23 for
+  // the soft-drop policy this stays consistent with, and #65 for the
+  // decision.
   const rawTemplate = rawBazaar?.routeTemplate;
-  if (rawTemplate !== undefined) {
-    if (!isValidRouteTemplate(rawTemplate)) {
+  if (rawTemplate !== undefined && !isValidRouteTemplate(rawTemplate)) {
+    if (isHostileRouteTemplate(rawTemplate)) {
       result.hardDrop = true;
       result.reason = 'invalid_routeTemplate';
       return result;
     }
+    result.softDrops.push('routeTemplate');
   }
 
   // 3. serviceName validation

@@ -15,13 +15,14 @@ import { createApp } from '../../src/app.js';
  * API keys are given as `id:secret` and hashed here the way resolveConfig does,
  * so a test states the secret it will present rather than a digest.
  */
-export function testConfig({ apiKeys = [] } = {}) {
+export function testConfig({ apiKeys = [], networks = ['stellar:testnet'] } = {}) {
   return {
     apiKeys: apiKeys.map(entry => {
       const idx = entry.indexOf(':');
       const [id, secret] = idx > 0 ? [entry.slice(0, idx), entry.slice(idx + 1)] : ['key_0', entry];
       return { id, hash: createHash('sha256').update(secret).digest() };
     }),
+    networks,
   };
 }
 
