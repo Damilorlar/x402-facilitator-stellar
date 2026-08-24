@@ -71,7 +71,8 @@ The validation rules for resources submitted to the catalog are as follows:
 | Field | Failure | Outcome | Reason |
 |---|---|---|---|
 | Extension schema | Invalid | **Hard drop** (resource discarded) | Must conform to upstream bazaar spec. |
-| `routeTemplate` | Invalid / Traversal | **Hard drop** (resource discarded) | Security boundary to prevent SSRF and traversal. |
+| `routeTemplate` | Traversal / protocol smuggling / unparseable | **Hard drop** (resource discarded) | Security boundary to prevent SSRF and traversal. |
+| `routeTemplate` | Malformed but not hostile (e.g. a bare wildcard `*`) | **Soft drop** (field removed, resource still lands) | Upstream's own SDK registers a wildcard route by default and warns it degrades to auto-generated parameter names — a seller on stock defaults should not silently vanish from discovery. See #65. |
 | `serviceName` | Invalid / Oversized | **Soft drop** (field removed) | Protects against UI bloat and poisoning. |
 | `iconUrl` | Invalid or private IP | **Soft drop** (field removed) | Protects against SSRF tracking pixels and local probes. |
 | `description` | Contains HTML or oversized | **Truncated** (up to 200 chars) | Prevents script injection and limits storage impact. |

@@ -86,17 +86,91 @@ describe('malformed bodies always carry a reason', () => {
       ['paymentRequirements only', { paymentRequirements: VALID_BODY.paymentRequirements }],
       ['a null payload', { paymentPayload: null, paymentRequirements: {} }],
     ]) {
-      test(`POST ${route} with ${label} → 400 and a non-null invalidReason`, async () => {
+      test(`POST ${route} with ${label} → 400 and a non-null reason`, async () => {
         const res = await app.post(route, body);
         assert.equal(res.status, 400);
         const json = await res.json();
-        assert.equal(json.isValid, false);
         // A null reason anywhere is an acceptance failure — an agent has to
-        // branch on a code rather than parse prose.
-        assert.equal(json.invalidReason, 'invalid_request');
-        assert.ok(json.invalidMessage, 'invalidMessage must not be empty');
+        // branch on a code rather than parse prose. /verify and /settle
+        // disagree on the rest of the shape, so only the reason vocabulary
+        // is shared.
+        if (route === '/settle') {
+          assert.equal(json.success, false);
+          assert.equal(json.errorReason, 'invalid_request');
+          assert.ok(json.errorMessage, 'errorMessage must not be empty');
+          assert.equal(json.transaction, '');
+        } else {
+          assert.equal(json.isValid, false);
+          assert.equal(json.invalidReason, 'invalid_request');
+          assert.ok(json.invalidMessage, 'invalidMessage must not be empty');
+        }
       });
     }
+  }
+
+  test('POST /settle with a malformed body keeps the settle response shape (#68)', async () => {
+    // /verify and /settle disagree on what a rejection looks like: settle
+    // still needs `transaction` and `network` even on a transport-level
+    // rejection, so a client can attribute the failure without correlating
+    // out of band.
+    const res = await app.post('/settle', { paymentPayload: VALID_BODY.paymentPayload });
+    assert.equal(res.status, 400);
+    const json = await res.json();
+    assert.equal(json.success, false);
+    assert.equal(json.errorReason, 'invalid_request');
+    assert.ok(json.errorMessage);
+    assert.equal(json.transaction, '');
+    // No paymentRequirements was sent at all, so there is no network to
+    // report — matching the existing facilitator_error catch path's
+    // convention of passing through whatever the body did/didn't carry.
+    assert.equal(json.network, undefined);
+  });
+
+  for (const route of ['/verify', '/settle']) {
+    test(`POST ${route} rejects a non-object paymentPayload (#68)`, async () => {
+      const res = await app.post(route, {
+        paymentPayload: 'not-an-object',
+        paymentRequirements: VALID_BODY.paymentRequirements,
+      });
+      assert.equal(res.status, 400);
+      const json = await res.json();
+      const reason = route === '/settle' ? json.errorReason : json.invalidReason;
+      const message = route === '/settle' ? json.errorMessage : json.invalidMessage;
+      assert.equal(reason, 'invalid_request');
+      assert.match(message, /paymentPayload/);
+    });
+
+    test(`POST ${route} rejects a network this instance does not serve, by name (#68)`, async () => {
+      const res = await app.post(route, {
+        paymentPayload: VALID_BODY.paymentPayload,
+        paymentRequirements: { ...VALID_BODY.paymentRequirements, network: 'stellar:pubnet' },
+      });
+      assert.equal(res.status, 400);
+      const json = await res.json();
+      const reason = route === '/settle' ? json.errorReason : json.invalidReason;
+      // Distinct from invalid_request so a client can branch on it.
+      assert.equal(reason, 'unsupported_network');
+    });
+
+    test(`POST ${route} passes payload.payload through un-inspected (#68)`, async () => {
+      // An unrecognised field inside payload must not cause rejection — that
+      // content is the scheme's to judge, not the transport's.
+      const facilitator = stubFacilitator();
+      const app2 = await serve({ facilitator });
+      try {
+        const body = {
+          paymentPayload: {
+            ...VALID_BODY.paymentPayload,
+            payload: { transaction: 'AAAAAgAAAA...', anUnrecognisedField: { nested: true } },
+          },
+          paymentRequirements: VALID_BODY.paymentRequirements,
+        };
+        const res = await app2.post(route, body);
+        assert.equal(res.status, 200);
+      } finally {
+        await app2.close();
+      }
+    });
   }
 });
 

@@ -1,0 +1,809 @@
+openapi: 3.1.0
+info:
+  title: x402 Facilitator (Stellar)
+  version: 0.0.1
+  description: |
+    This document describes the **transport** — the eight HTTP routes in
+    `src/app.js` — and nothing more. It is deliberately silent about what
+    makes a payment valid or a settlement succeed: verify/settle semantics
+    live in the upstream, Apache-2.0 `@x402/stellar` package
+    (`ExactStellarScheme`), and this repo's house rule is that we do not
+    reimplement or re-describe them. `paymentPayload` and
+    `paymentRequirements` are therefore modeled loosely here — the shape the
+    transport itself depends on (object, `scheme` a string, `network` a
+    string this instance serves) is required; the contents of
+    `paymentPayload.payload` (the transaction XDR and everything inside it)
+    are accepted verbatim and are the scheme's to judge, not this document's.
+
+    Two things about status codes are easy to get wrong when modeling this
+    service and are called out again on the routes themselves: `POST /verify`
+    and `POST /settle` return **200** for a *failed payment* — `isValid:
+    false` / `success: false` are values in a 200 body, not 4xx/5xx. A spec
+    that models payment failure as an HTTP error status describes a different
+    service. 4xx here is reserved for the transport rejecting the request
+    itself (a malformed body, an unserved network, a missing/invalid API
+    key), which is what request-validation.js and the auth middleware in
+    `src/app.js` are responsible for — see #68 and #65's neighboring issue
+    #6 for the rejection-reason taxonomy.
+  license:
+    name: Apache-2.0
+    url: https://github.com/accensa/x402-facilitator-stellar/blob/main/LICENSE
+
+servers:
+  - url: http://localhost:3402
+    description: Local development (testnet, open mode by default)
+
+tags:
+  - name: payments
+    description: The x402 verify/settle surface.
+  - name: discovery
+    description: The Bazaar catalog — automatic and manual resource discovery.
+  - name: meta
+    description: Liveness, capability advertisement, and usage.
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [meta]
+      summary: Liveness check
+      description: |
+        Currently unconditional — it reports process liveness, not
+        readiness (it does not check RPC connectivity or signer health).
+        See #100 for making this reflect actual readiness.
+      security: []
+      responses:
+        '200':
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+              examples:
+                default:
+                  value: { ok: true }
+
+  /supported:
+    get:
+      tags: [meta]
+      summary: Advertise supported scheme/network pairs and extensions
+      description: |
+        Always open, even when API keys are configured elsewhere: a client
+        must be able to read this before it has any relationship with the
+        service. Passed through from `facilitator.getSupported()` untouched,
+        including the Stellar-specific `extra` block (`areFeesSponsored`).
+      security: []
+      responses:
+        '200':
+          description: Supported kinds, extensions, and signer addresses.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupportedResponse'
+              examples:
+                default:
+                  value:
+                    kinds:
+                      - x402Version: 2
+                        scheme: exact
+                        network: 'stellar:testnet'
+                        extra: { areFeesSponsored: true }
+                    extensions: ['bazaar']
+                    signers: { 'stellar:*': ['GABC...'] }
+
+  /usage:
+    get:
+      tags: [meta]
+      summary: Per-key usage counters
+      description: |
+        Requires an API key **even in open mode** — usage accounting has no
+        meaning for an anonymous caller, so this route refuses with a
+        distinct reason (`open_mode_usage_forbidden`) rather than silently
+        aggregating across everyone.
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Usage counters for the authenticated key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageResponse'
+        '401':
+          description: |
+            Missing/invalid key, or open mode (no keys configured at all —
+            `open_mode_usage_forbidden`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthError'
+
+  /verify:
+    post:
+      tags: [payments]
+      summary: Verify a payment without settling it
+      description: |
+        **Returns HTTP 200 even when the payment is invalid.**
+        `isValid: false` with a non-null `invalidReason` is a normal,
+        successful response from this endpoint's point of view — the
+        transport did its job by reporting the outcome. 4xx here means the
+        transport itself rejected the *request* before reaching the scheme
+        (malformed body, unserved network) or that a rate limit was hit; it
+        never means "payment invalid".
+      security:
+        - ApiKeyAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyRequest'
+      responses:
+        '200':
+          description: |
+            Verification result — check `isValid`, not the status code.
+          headers:
+            EXTENSION-RESPONSES:
+              $ref: '#/components/headers/ExtensionResponses'
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyResponse'
+              examples:
+                valid:
+                  value: { isValid: true }
+                invalid:
+                  value:
+                    isValid: false
+                    invalidReason: invalid_exact_stellar_payload_authorization_not_signed
+                    invalidMessage: payer signature missing
+                    payer: GPAYER...
+        '400':
+          description: |
+            The transport rejected the request body itself — see
+            request-validation.js. Reason is one of `invalid_request` (body
+            shape) or `unsupported_network` (well-formed body naming a
+            network this instance does not serve).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyResponse'
+              examples:
+                malformed:
+                  value:
+                    isValid: false
+                    invalidReason: invalid_request
+                    invalidMessage: 'paymentPayload must be an object'
+                unsupportedNetwork:
+                  value:
+                    isValid: false
+                    invalidReason: unsupported_network
+                    invalidMessage: 'network "stellar:pubnet" is not served by this instance (serves: stellar:testnet)'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /settle:
+    post:
+      tags: [payments]
+      summary: Verify and settle a payment on-chain
+      description: |
+        **Returns HTTP 200 even when settlement fails.** `success: false`
+        with a non-null `errorReason` is a normal response; `transaction`
+        and `network` are always present, even on failure, so a client can
+        attribute the failure without correlating out of band. As with
+        `/verify`, 4xx here is the transport rejecting the request itself,
+        never a settlement outcome.
+      security:
+        - ApiKeyAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettleRequest'
+      responses:
+        '200':
+          description: |
+            Settlement result — check `success`, not the status code.
+          headers:
+            EXTENSION-RESPONSES:
+              $ref: '#/components/headers/ExtensionResponses'
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettleResponse'
+              examples:
+                success:
+                  value:
+                    success: true
+                    transaction: abc123...
+                    network: 'stellar:testnet'
+                failure:
+                  value:
+                    success: false
+                    errorReason: facilitator_error
+                    errorMessage: rpc unreachable
+                    transaction: ''
+                    network: 'stellar:testnet'
+        '400':
+          description: |
+            The transport rejected the request body itself. Note the
+            response shape differs from `/verify`'s 400: `/settle` always
+            carries `transaction` and `network`, even in a transport-level
+            rejection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettleResponse'
+              examples:
+                malformed:
+                  value:
+                    success: false
+                    errorReason: invalid_request
+                    errorMessage: 'paymentPayload must be an object'
+                    transaction: ''
+                    network: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /discovery/resources:
+    post:
+      tags: [discovery]
+      summary: Manually register a resource in the Bazaar catalog
+      description: |
+        The secondary registration path. The primary one is automatic —
+        cataloging off `/verify`/`/settle` for any payment whose payload
+        carries the discovery extension, which never blocks or fails the
+        payment itself (see `docs/BAZAAR.md`). This route is for a seller
+        registering something after the fact, without a fresh payment.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyRequest'
+      responses:
+        '200':
+          description: Registered (or soft-dropped fields noted).
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, resource, softDrops]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+                  resource:
+                    $ref: '#/components/schemas/CatalogResource'
+                  softDrops:
+                    type: array
+                    items:
+                      type: string
+                    description: |
+                      Fields dropped for quality reasons rather than the
+                      whole resource — e.g. `routeTemplate` for a wildcard
+                      route (#65), `serviceName`, `iconUrl`,
+                      `description_truncated`, `tags_filtered`.
+        '400':
+          description: |
+            Hard drop — the resource was rejected outright (invalid
+            discovery extension, or a hostile `routeTemplate`: traversal or
+            protocol smuggling). See `docs/BAZAAR.md` for the full policy
+            table.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, reason]
+                properties:
+                  error:
+                    type: string
+                  reason:
+                    type: string
+                    enum:
+                      - invalid_request
+                      - missing_or_invalid_discovery_extension
+                      - invalid_extension_schema
+                      - invalid_routeTemplate
+                      - catalog_error
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    get:
+      tags: [discovery]
+      summary: List cataloged resources
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/FilterType'
+        - $ref: '#/components/parameters/FilterPayTo'
+        - $ref: '#/components/parameters/FilterScheme'
+        - $ref: '#/components/parameters/FilterNetwork'
+        - $ref: '#/components/parameters/FilterExtensions'
+        - name: limit
+          in: query
+          description: Clamped to [1, 100]; defaults to 20.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: A page of cataloged resources, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [x402Version, items, pagination]
+                properties:
+                  x402Version:
+                    type: integer
+                    const: 2
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CatalogResource'
+                  pagination:
+                    type: object
+                    required: [limit, offset, total]
+                    properties:
+                      limit:
+                        type: integer
+                      offset:
+                        type: integer
+                      total:
+                        type: integer
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /discovery/search:
+    get:
+      tags: [discovery]
+      summary: Lexical (and, if configured, hybrid semantic) search over the catalog
+      security: []
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Required — a 400 is returned if omitted.
+        - $ref: '#/components/parameters/FilterType'
+        - $ref: '#/components/parameters/FilterPayTo'
+        - $ref: '#/components/parameters/FilterScheme'
+        - $ref: '#/components/parameters/FilterNetwork'
+        - $ref: '#/components/parameters/FilterExtensions'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          description: Opaque, base64-encoded. Advisory, like `limit` — the server may return fewer results than asked.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Ranked search results.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [x402Version, resources, partialResults, pagination]
+                properties:
+                  x402Version:
+                    type: integer
+                    const: 2
+                  resources:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CatalogResource'
+                  partialResults:
+                    type: boolean
+                    description: |
+                      True when the backend is degraded — e.g. no embeddings
+                      provider configured, or a resource not yet re-embedded.
+                      Currently only meaningful for the semantic leg of
+                      search; the memory-backed spike has no partitioned
+                      backend of its own to degrade.
+                  pagination:
+                    type: object
+                    required: [limit, cursor]
+                    properties:
+                      limit:
+                        type: integer
+                      cursor:
+                        type: [string, 'null']
+                        description: Opaque cursor for the next page, or null if there is none.
+        '400':
+          description: '`query` was omitted.'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, reason]
+                properties:
+                  error:
+                    type: string
+                    const: invalid_request
+                  reason:
+                    type: string
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        Two forms are accepted: `Authorization: Bearer <secret>` or
+        `Authorization: <secret>` (no scheme prefix). Verified with a
+        constant-time comparison against the SHA-256 digests resolved at
+        boot from `FACILITATOR_API_KEYS`. If no keys are configured at all,
+        the facilitator runs in **open mode** and every route except
+        `/usage` is unauthenticated — correct for a free testnet instance,
+        strongly discouraged on pubnet. See `docs/AUTHENTICATION.md`.
+
+        `/usage` requires a key even in open mode (`open_mode_usage_forbidden`
+        otherwise). `/healthz`, `/supported`, and both `GET /discovery/*`
+        routes are always open regardless of mode.
+
+  headers:
+    ExtensionResponses:
+      description: |
+        Base64-encoded JSON, present on `/verify` and `/settle` responses
+        whenever the payment carried a discovery extension. Decodes to
+        `{"bazaar": {"status": ..., "code": ..., "reason"?: ...}}` — status
+        is one of `landed`, `partially landed`, `rejected`, or
+        `"not attempted"` (payload carried no/invalid discovery extension).
+        See #146 and `docs/BAZAAR.md`.
+      schema:
+        type: string
+        format: byte
+    RateLimitLimit:
+      description: The caller's limit for the current window.
+      schema:
+        type: integer
+    RateLimitRemaining:
+      description: Requests remaining in the current window.
+      schema:
+        type: integer
+    RateLimitReset:
+      description: Unix timestamp (seconds) when the current window resets.
+      schema:
+        type: integer
+    RetryAfter:
+      description: Seconds to wait before retrying. Present only on 429 responses.
+      schema:
+        type: integer
+
+  parameters:
+    FilterType:
+      name: type
+      in: query
+      schema:
+        type: string
+        enum: [http, mcp]
+    FilterPayTo:
+      name: payTo
+      in: query
+      schema:
+        type: string
+    FilterScheme:
+      name: scheme
+      in: query
+      schema:
+        type: string
+    FilterNetwork:
+      name: network
+      in: query
+      schema:
+        type: string
+    FilterExtensions:
+      name: extensions
+      in: query
+      description: Comma-separated, or repeated. Every named extension must be present on a matching resource.
+      style: form
+      explode: false
+      schema:
+        type: array
+        items:
+          type: string
+
+  responses:
+    Unauthorized:
+      description: |
+        Missing, malformed, or unrecognized API key. Reason is one of
+        `missing_auth_header`, `malformed_auth_header`, or `invalid_api_key`.
+        Not returned at all when the instance is running in open mode.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthError'
+    RateLimited:
+      description: The caller's rate limit was exceeded for this operation.
+      headers:
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimitLimit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimitRemaining'
+        RateLimit-Reset:
+          $ref: '#/components/headers/RateLimitReset'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, reason]
+            properties:
+              error:
+                type: string
+                const: rate_limited
+              reason:
+                type: string
+                description: |
+                  Which limit was hit (e.g. `verify_rpm`, `settle_rpd`,
+                  `fee_spd`, `catalog_rpm`). The open set is not finalized —
+                  see #6.
+    InternalError:
+      description: An unexpected server-side failure (e.g. a catalog query error).
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+
+  schemas:
+    AuthError:
+      type: object
+      required: [error, reason]
+      properties:
+        error:
+          type: string
+          const: unauthorized
+        reason:
+          type: string
+          enum:
+            - missing_auth_header
+            - malformed_auth_header
+            - invalid_api_key
+            - open_mode_usage_forbidden
+
+    SupportedResponse:
+      type: object
+      required: [kinds, extensions, signers]
+      properties:
+        kinds:
+          type: array
+          items:
+            type: object
+            required: [x402Version, scheme, network]
+            properties:
+              x402Version:
+                type: integer
+              scheme:
+                type: string
+              network:
+                type: string
+              extra:
+                type: object
+                description: Scheme-specific capabilities. For Stellar's `exact` scheme, includes `areFeesSponsored`.
+                additionalProperties: true
+        extensions:
+          type: array
+          items:
+            type: string
+        signers:
+          type: object
+          description: Map of network pattern (e.g. `stellar:*`) to signer addresses.
+          additionalProperties:
+            type: array
+            items:
+              type: string
+
+    UsageResponse:
+      type: object
+      description: |
+        Counters for the current window per limit family, keyed by name
+        (`verify_rpm`, `settle_rpm`, `settle_rph`, `settle_rpd`, `fee_spd`).
+        The exact key set tracks `src/rate-limit.js`'s configured limits.
+      additionalProperties:
+        type: integer
+
+    PaymentPayload:
+      type: object
+      description: |
+        The spec's payload envelope, accepted verbatim. `payload` (and
+        everything inside it, including `payload.transaction`) is passed
+        through unwrapped and un-renamed to the upstream scheme — this
+        transport does not inspect it. Only presence-and-object-ness is
+        required here.
+      required: [payload]
+      properties:
+        x402Version:
+          type: integer
+        scheme:
+          type: string
+        network:
+          type: string
+        resource:
+          type: object
+          additionalProperties: true
+        extensions:
+          type: object
+          additionalProperties: true
+        payload:
+          type: object
+          description: 'Scheme-specific. For `exact` on Stellar: `{transaction: <XDR>}`. Not validated by the transport.'
+          additionalProperties: true
+      additionalProperties: true
+
+    PaymentRequirements:
+      type: object
+      description: |
+        Only `scheme` and `network` are checked by the transport itself
+        (both required strings; `network` must be one this instance serves —
+        see request-validation.js and #68). Everything else is passed
+        through to the scheme unvalidated.
+      required: [scheme, network]
+      properties:
+        scheme:
+          type: string
+        network:
+          type: string
+          description: A CAIP-2 identifier this instance serves, e.g. `stellar:testnet` or `stellar:pubnet`.
+        asset:
+          type: string
+        maxAmountRequired:
+          type: string
+        payTo:
+          type: string
+        maxTimeoutSeconds:
+          type: integer
+        extra:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+
+    VerifyRequest:
+      type: object
+      required: [paymentPayload, paymentRequirements]
+      properties:
+        paymentPayload:
+          $ref: '#/components/schemas/PaymentPayload'
+        paymentRequirements:
+          $ref: '#/components/schemas/PaymentRequirements'
+
+    SettleRequest:
+      $ref: '#/components/schemas/VerifyRequest'
+
+    VerifyResponse:
+      type: object
+      required: [isValid]
+      properties:
+        isValid:
+          type: boolean
+        invalidReason:
+          type: [string, 'null']
+          description: |
+            Non-null whenever `isValid` is false — a null reason anywhere is
+            an acceptance failure for this service. Transport-level values
+            are `invalid_request` and `unsupported_network`
+            (request-validation.js) and `facilitator_error` (an exception
+            above the scheme). Everything else is the scheme's own
+            vocabulary (e.g. `invalid_exact_stellar_payload_*`) and is
+            passed through unmodified — see #6 for the open taxonomy.
+        invalidMessage:
+          type: string
+        payer:
+          type: string
+      additionalProperties: true
+
+    SettleResponse:
+      type: object
+      required: [success, transaction, network]
+      properties:
+        success:
+          type: boolean
+        errorReason:
+          type: [string, 'null']
+        errorMessage:
+          type: string
+        transaction:
+          type: string
+          description: Empty string, not omitted, when settlement never reached the chain.
+        network:
+          type: [string, 'null']
+        payer:
+          type: string
+      additionalProperties: true
+
+    CatalogResource:
+      type: object
+      description: |
+        See `docs/BAZAAR.md` for the identity model (HTTP resources keyed by
+        `url`; MCP resources keyed by `(url, toolName)`).
+      required: [type, url, scheme, network]
+      properties:
+        type:
+          type: string
+          enum: [http, mcp]
+        url:
+          type: string
+        toolName:
+          type: string
+          description: Present only when `type` is `mcp`.
+        serviceName:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        iconUrl:
+          type: string
+        scheme:
+          type: string
+        network:
+          type: string
+        payTo:
+          type: string
+        extensions:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
