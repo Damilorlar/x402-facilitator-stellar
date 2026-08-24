@@ -61,6 +61,110 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   app.use(requestLogger());
 
   /**
+   * Security headers (#86), hand-set rather than via helmet.
+   *
+   * helmet's value is its defaults for a document-serving app; this service
+   * returns JSON to programmatic clients and serves no HTML, no cookies and no
+   * user-supplied markup, so only three headers do real work here:
+   *
+   *   - X-Content-Type-Options: nosniff — stops a JSON response being
+   *     reinterpreted as something else by a browser.
+   *   - Strict-Transport-Security — meaningful for a hosted mainnet deployment
+   *     handling payment authorizations; conditional on NODE_ENV=production so
+   *     a local HTTP dev server cannot poison a browser's view of localhost.
+   *   - X-Powered-By — suppressed below; Express advertising itself is free
+   *     reconnaissance.
+   *
+   * Deliberately NOT set:
+   *   - Content-Security-Policy — defends against content injection into
+   *     documents; no documents are served. If the OpenAPI work adds a Swagger
+   *     UI page, that changes the calculus and CSP (plus helmet wholesale)
+   *     should be revisited then.
+   *   - X-Frame-Options / frame-ancestors — nothing here is framable; there is
+   *     no HTML to clickjack.
+   */
+  app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    if (config.nodeEnv === 'production') {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+  });
+
+  // Headers a browser client must be able to read but which are not
+  // CORS-safelisted response headers: without naming them in
+  // Access-Control-Expose-Headers they are invisible to browser JavaScript,
+  // which would leave the Bazaar cataloguing outcome unreadable from a browser.
+  const EXPOSED_HEADERS = [
+    'RateLimit-Limit',
+    'RateLimit-Remaining',
+    'RateLimit-Reset',
+    'Retry-After',
+    'EXTENSION-RESPONSES',
+  ].join(', ');
+
+  /**
+   * CORS (#76), decided per route class rather than globally, because the two
+   * classes have opposite risk profiles:
+   *
+   *   - Public reads (/supported, GET /discovery/resources,
+   *     /discovery/search) are unauthenticated and carry no credential worth
+   *     protecting, so they default to `*`: a browser-based agent, catalog
+   *     explorer or seller checking their own listing needs these.
+   *   - Authenticated routes (/verify, /settle, /usage, POST
+   *     /discovery/resources) carry an API key. A permissive policy there
+   *     invites any web page to send a caller's key somewhere it should not
+   *     go, so the default is no grant at all: origins must be explicitly
+   *     allowlisted via CORS_ALLOWED_ORIGINS.
+   *
+   * Authorization is not a safelisted request header, so every browser call to
+   * the payment routes triggers a preflight that must be answered with the
+   * right Allow-Headers or the request silently fails — hence OPTIONS handling
+   * on both classes, mounted before the auth middleware.
+   *
+   * Hand-set rather than the cors package: the per-class split means the
+   * package's single global config would be fought, and three headers add no
+   * dependency surface worth paying for.
+   */
+  function cors(policy) {
+    return (req, res, next) => {
+      res.setHeader('Access-Control-Expose-Headers', EXPOSED_HEADERS);
+
+      const origin = req.get('origin');
+      const allowlisted = origin && config.cors.allowedOrigins.includes(origin);
+      let granted;
+      if (policy === 'public') {
+        granted = allowlisted ? origin : config.cors.allowedOrigins.length === 0 ? '*' : false;
+      } else {
+        // Never default-open anything authenticated.
+        granted = allowlisted ? origin : false;
+      }
+
+      res.setHeader('Vary', 'Origin');
+
+      if (granted) {
+        res.setHeader('Access-Control-Allow-Origin', granted);
+      }
+
+      if (req.method === 'OPTIONS') {
+        // Answer the preflight even when the origin is not granted: the 204
+        // carries no ACAO, so the browser still blocks the actual request —
+        // which is the enforcement point, not the preflight status.
+        res.setHeader(
+          'Access-Control-Allow-Methods',
+          policy === 'public' ? 'GET, OPTIONS' : 'POST, OPTIONS',
+        );
+        res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+        res.setHeader('Access-Control-Max-Age', '600');
+        return res.status(204).end();
+      }
+
+      return next();
+    };
+  }
+
+  /**
    * Catalogs a resource declared in a payment, off the hot path.
    *
    * Cataloging must never delay or fail a payment: the work is enqueued and the
@@ -228,7 +332,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * acceptance item. getSupported() assembles it from the registered schemes, so
    * it is passed through rather than hand-built.
    */
-  app.get('/supported', (_req, res) => {
+  app.get('/supported', cors('public'), (_req, res) => {
     res.json(facilitator.getSupported());
   });
 
@@ -236,7 +340,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     res.json(await rateLimiter.getUsage(req.keyId));
   });
 
-  app.post('/verify', requireApiKey, async (req, res) => {
+  app.post('/verify', cors('authenticated'), requireApiKey, async (req, res) => {
     const check = await rateLimiter.checkVerify(req);
     if (!check.allowed) return handleRateLimit(res, check);
 
@@ -268,7 +372,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     }
   });
 
-  app.post('/settle', requireApiKey, async (req, res) => {
+  app.post('/settle', cors('authenticated'), requireApiKey, async (req, res) => {
     const check = await rateLimiter.checkSettle(req);
     if (!check.allowed) return handleRateLimit(res, check);
 
@@ -314,7 +418,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * Automatic cataloging off the payment path is the primary one — anything
    * that requires a seller to act after being paid gets skipped.
    */
-  app.post('/discovery/resources', requireApiKey, async (req, res) => {
+  app.post('/discovery/resources', cors('authenticated'), requireApiKey, async (req, res) => {
     const body = readPaymentBody(req, res);
     if (!body) return;
 
@@ -335,7 +439,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     }
   });
 
-  app.get('/discovery/resources', async (req, res) => {
+  app.get('/discovery/resources', cors('public'), async (req, res) => {
     let extensions;
     if (req.query.extensions) {
       extensions = Array.isArray(req.query.extensions)
@@ -375,7 +479,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     }
   });
 
-  app.get('/discovery/search', async (req, res) => {
+  app.get('/discovery/search', cors('public'), async (req, res) => {
     if (!req.query.query) {
       return res.status(400).json({ error: 'invalid_request', reason: 'query is required' });
     }
@@ -409,6 +513,78 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     } catch (err) {
       res.status(500).json({ error: 'internal_error', message: err.message });
     }
+  });
+
+  /**
+   * Preflight routes (#76).
+   *
+   * Express 5 does not answer OPTIONS itself, so each CORS-enabled path gets
+   * one explicitly. The cors() middleware sees the OPTIONS method and replies
+   * 204 — carrying ACAO only when the origin is granted — before auth
+   * middleware ever runs, which matters because a preflight cannot carry the
+   * API key.
+   */
+  app.options('/supported', cors('public'));
+  app.options('/discovery/search', cors('public'));
+  app.options('/discovery/resources', cors('authenticated'));
+  app.options('/verify', cors('authenticated'));
+  app.options('/settle', cors('authenticated'));
+
+  /**
+   * 404 (#78). Every rejection carries a non-null reason code, transport-level
+   * ones included — an unknown route is no exception.
+   */
+  app.use((req, res) => {
+    res.status(404).json({ error: 'not_found', reason: 'route_not_found' });
+  });
+
+  /**
+   * The one error boundary (#78), registered last so Express 5 forwards both
+   * thrown errors and rejected promises from async handlers to it. The
+   * route-level catch blocks above are left alone: they encode deliberate
+   * decisions (/verify answers 200 with isValid: false rather than a 500,
+   * because to a client a 500 is indistinguishable from the service being
+   * down); this boundary only catches what escapes them.
+   *
+   * The response shape is matched to the route, not flattened into a generic
+   * {error} — /verify failures look like verification failures, /settle
+   * failures carry transaction and network so a client can attribute the
+   * failure without correlating out of band.
+   *
+   * Stack traces go to the server log only, never the wire, and that is not
+   * gated on NODE_ENV — which is unset in the Docker image.
+   */
+  app.use((err, req, res, _next) => {
+    console.error(`[Error] ${err?.type ?? err?.name ?? 'Error'}: ${err?.message}`);
+
+    let status = 500;
+    let code = 'internal_error';
+    if (err?.type === 'entity.parse.failed') {
+      status = 400;
+      code = 'malformed_json';
+    } else if (err?.type === 'entity.too.large') {
+      status = 413;
+      code = 'payload_too_large';
+    }
+    const message = err instanceof Error ? err.message : String(err);
+
+    if (req.path === '/verify') {
+      return res.status(status).json({
+        isValid: false,
+        invalidReason: code,
+        invalidMessage: message,
+      });
+    }
+    if (req.path === '/settle') {
+      return res.status(status).json({
+        success: false,
+        errorReason: code,
+        errorMessage: message,
+        transaction: '',
+        network: req.body?.paymentRequirements?.network,
+      });
+    }
+    return res.status(status).json({ error: code, reason: code });
   });
 
   return app;

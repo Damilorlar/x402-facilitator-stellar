@@ -16,8 +16,8 @@ docker compose up
 
 ### Loading a .env file
 
-For local (non-Docker) runs, `npm start` and `npm run dev` load a `.env` file
-from the working directory using Node's built-in `--env-file-if-exists`:
+For local (non-Docker) runs, the service loads a `.env` file from the working
+directory at startup:
 
 ```bash
 cp .env.example .env   # fill in FACILITATOR_SECRET
@@ -26,10 +26,10 @@ npm start
 
 Properties of this mechanism, and why it is wired this way:
 
-- **No dependency.** It is part of Node 20.18+/22.9+, which covers the
-  `engines: >=20` claim and the `node:20-alpine` image.
-- **Tolerant of absence.** Production has no `.env`; the `-if-exists` form
-  starts normally with whatever the environment provides.
+- **Development convenience only.** The file is loaded when `NODE_ENV` is not
+  `production`. Production has no `.env`; there the environment comes from the
+  orchestrator, so a stray `.env` left next to the image cannot shadow it.
+- **Tolerant of absence.** No file, no error — the environment stands alone.
 - **Real environment wins.** Variables already set in the environment are never
   overridden by `.env`. A stale local file cannot silently beat what a secrets
   manager injected.

@@ -31,8 +31,8 @@
     "x402-mcp": "./src/mcp/cli.js"
   },
   "scripts": {
-    "start": "node --env-file-if-exists=.env src/server.js",
-    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
     "test": "node --test",
     "test:watch": "node --test --watch",
     "e2e": "node scripts/e2e.mjs",
@@ -46,6 +46,7 @@
     "@stellar/stellar-sdk": "^16.2.0",
     "@x402/core": "^2.21.0",
     "@x402/stellar": "^2.21.0",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "ioredis": "^6.0.0",
     "pg": "^8.23.0",
