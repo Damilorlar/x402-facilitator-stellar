@@ -40,6 +40,28 @@ test('Hostile Inputs Validation', async t => {
     assert.equal(res.reason, 'invalid_routeTemplate');
   });
 
+  await t.test('Soft drops a wildcard routeTemplate instead of dropping the resource (#65)', () => {
+    // This is what upstream's own SDK registers by default for a wildcard
+    // route, and it warns about the degraded metadata rather than refusing
+    // to send it. It must not vanish from discovery.
+    const payload = {
+      x402Version: 2,
+      resource: { url: 'http://example.com/weather/paris' },
+      extensions: {
+        bazaar: {
+          info: { input: { type: 'http', method: 'GET' }, scheme: 'exact' },
+          schema: { type: 'object' },
+          routeTemplate: '*',
+        },
+      },
+    };
+    const res = validateForCatalog(payload, baseReq);
+    assert.equal(res.hardDrop, false);
+    assert.ok(res.softDrops.includes('routeTemplate'));
+    assert.ok(res.resource);
+    assert.equal(res.resource.url, 'http://example.com/weather/paris');
+  });
+
   await t.test('Soft drops script in description and truncates', () => {
     const payload = {
       x402Version: 2,
