@@ -204,7 +204,10 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
       }
       return null;
     }
-    return { paymentPayload: result.paymentPayload, paymentRequirements: result.paymentRequirements };
+    return {
+      paymentPayload: result.paymentPayload,
+      paymentRequirements: result.paymentRequirements,
+    };
   }
 
   app.get('/healthz', (_req, res) => res.json({ ok: true }));

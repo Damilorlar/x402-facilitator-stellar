@@ -17,7 +17,12 @@
  * `redact` option.
  */
 
-const REDACTED_KEY_NAMES = new Set(['authorization', 'cookie', 'set-cookie', 'proxy-authorization']);
+const REDACTED_KEY_NAMES = new Set([
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'proxy-authorization',
+]);
 
 function isSensitiveKey(key) {
   const lower = key.toLowerCase();
