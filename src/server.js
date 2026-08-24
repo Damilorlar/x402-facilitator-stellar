@@ -10,6 +10,8 @@ import { resolveConfig } from './config.js';
 import { buildFacilitator } from './facilitator.js';
 import { installRpcRetry } from './rpc-retry.js';
 import { RateLimiter } from './rate-limit.js';
+import { RedisRateLimiter } from './redis-rate-limit.js';
+import { buildIdempotencyStore } from './idempotency.js';
 import { MemoryCatalogStore } from './catalog/memory.js';
 import { createApp } from './app.js';
 
@@ -19,9 +21,12 @@ installRpcRetry({ log: msg => console.warn(`  ${msg}`) });
 
 const config = resolveConfig();
 const { facilitator, signers } = buildFacilitator(config);
-const rateLimiter = new RateLimiter(config.rateLimits);
+const rateLimiter = config.redisUrl
+  ? new RedisRateLimiter(config.rateLimits, { redisUrl: config.redisUrl })
+  : new RateLimiter(config.rateLimits);
 const catalog = new MemoryCatalogStore(config);
-const app = createApp(config, facilitator, rateLimiter, catalog);
+const idempotency = buildIdempotencyStore(config);
+const app = createApp(config, facilitator, rateLimiter, catalog, idempotency);
 
 app.listen(config.port, () => {
   console.log(`x402 Stellar facilitator listening on :${config.port}`);
@@ -38,4 +43,16 @@ app.listen(config.port, () => {
   } else {
     console.log(`  auth     : ${config.apiKeys.length} API key(s) configured`);
   }
+  if (config.trustProxy !== undefined) {
+    console.log(
+      `  proxy    : trust proxy set to ${Array.isArray(config.trustProxy) ? config.trustProxy.join(', ') : config.trustProxy}`,
+    );
+  }
+  // Never log the URLs themselves: they may embed credentials.
+  console.log(
+    `  state    : ${[
+      config.redisUrl ? 'redis rate limits' : 'in-memory rate limits',
+      config.databaseUrl ? 'postgres idempotency' : 'in-memory idempotency',
+    ].join(', ')}`,
+  );
 });

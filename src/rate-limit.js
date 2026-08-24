@@ -112,13 +112,16 @@ export class RateLimiter {
   }
 
   checkCatalog(req) {
-    const key = `catalog:${req.ip}`;
-    return this._checkLimit(key, this.limits.catalog);
+    const ownerId = req.keyId || req.ip;
+    const limits = this._getKeyConfig(req.keyId);
+    const res = this._check(ownerId, 'catalog', 60, limits.catalogRpm);
+    if (!res.allowed) res.reason = 'catalog_rate_limited';
+    return res;
   }
 
   recordCatalog(req) {
-    const key = `catalog:${req.ip}`;
-    this._increment(key);
+    const ownerId = req.keyId || req.ip;
+    this._increment(ownerId, 'catalog', 60, 1);
   }
 
   getUsage(keyId) {

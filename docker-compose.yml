@@ -8,10 +8,23 @@ services:
     environment:
       - FACILITATOR_SECRET=${FACILITATOR_SECRET}
       - DATABASE_URL=postgres://postgres:postgres@db:5432/x402_facilitator
+      - REDIS_URL=redis://redis:6379
       - PORT=3402
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   db:
     image: postgres:16-alpine

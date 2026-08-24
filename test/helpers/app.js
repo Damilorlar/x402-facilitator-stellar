@@ -15,8 +15,9 @@ import { createApp } from '../../src/app.js';
  * API keys are given as `id:secret` and hashed here the way resolveConfig does,
  * so a test states the secret it will present rather than a digest.
  */
-export function testConfig({ apiKeys = [], networks = ['stellar:testnet'] } = {}) {
+export function testConfig({ apiKeys = [], networks = ['stellar:testnet'], trustProxy } = {}) {
   return {
+    trustProxy,
     apiKeys: apiKeys.map(entry => {
       const idx = entry.indexOf(':');
       const [id, secret] = idx > 0 ? [entry.slice(0, idx), entry.slice(idx + 1)] : ['key_0', entry];
@@ -85,12 +86,13 @@ export function stubCatalog(overrides = {}) {
   };
 }
 
-export async function serve({ config, facilitator, rateLimiter, catalog } = {}) {
+export async function serve({ config, facilitator, rateLimiter, catalog, idempotency } = {}) {
   const app = createApp(
     config ?? testConfig(),
     facilitator ?? stubFacilitator(),
     rateLimiter ?? stubRateLimiter(),
     catalog ?? stubCatalog(),
+    idempotency,
   );
 
   const server = app.listen(0);

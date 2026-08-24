@@ -90,6 +90,22 @@ Sibling repositories in the [Accensa organisation](https://github.com/accensa):
 anchoring and refund vault). A seller can use those without this, and an agent can use
 this without those.
 
+### Running Locally
+
+The service loads a `.env` file at startup via Node's built-in
+`--env-file-if-exists` — no dependency involved, and nothing breaks when the
+file is absent (production passes real environment variables). Variables set in
+the real environment always win over `.env`, so a stale local file cannot
+silently override what a deployment injected.
+
+```bash
+cp .env.example .env   # then fill in FACILITATOR_SECRET
+npm start              # or: npm run dev (adds --watch)
+curl localhost:3402/healthz
+```
+
+`FACILITATOR_SECRET` is a signing key. `.env` is gitignored — never commit it.
+
 ### Tests
 
 ```bash
