@@ -6,12 +6,21 @@
  * can be exercised in a test without a listener, a real signer or a subprocess —
  * this file is only the wiring a test has no use for.
  */
+import dotenv from 'dotenv';
 import { resolveConfig } from './config.js';
 import { buildFacilitator } from './facilitator.js';
 import { installRpcRetry } from './rpc-retry.js';
 import { RateLimiter } from './rate-limit.js';
 import { MemoryCatalogStore } from './catalog/memory.js';
 import { createApp } from './app.js';
+
+// A .env file is a development convenience, not a deployment mechanism — in
+// production the environment comes from the orchestrator, so a stray .env left
+// next to the image must not be able to override or shadow it. resolveConfig()
+// below runs after this so a misconfiguration still fails at start.
+if (process.env.NODE_ENV !== 'production') {
+  dotenv.config({ quiet: true });
+}
 
 // Must run before the scheme makes any RPC call. Retries connection-level
 // failures only; see rpc-retry.js for what that deliberately excludes.
