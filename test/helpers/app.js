@@ -17,6 +17,7 @@ import { createApp } from '../../src/app.js';
  */
 export function testConfig({
   apiKeys = [],
+  networks = ['stellar:testnet'],
   corsAllowedOrigins = [],
   nodeEnv = 'development',
 } = {}) {
@@ -28,6 +29,7 @@ export function testConfig({
       const [id, secret] = idx > 0 ? [entry.slice(0, idx), entry.slice(idx + 1)] : ['key_0', entry];
       return { id, hash: createHash('sha256').update(secret).digest() };
     }),
+    networks,
   };
 }
 
