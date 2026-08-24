@@ -120,10 +120,68 @@ export function resolveConfig(env = process.env) {
     };
   }
 
+  /**
+   * Express `trust proxy` setting, from TRUST_PROXY.
+   *
+   * Behind a TLS terminator or load balancer, Express's default (off) makes
+   * req.ip the proxy's address, which collapses every open-mode caller into a
+   * single rate-limit bucket. The value must be specific — a hop count, a list
+   * of proxy addresses, or an Express preset like "loopback" — never "true",
+   * which trusts the leftmost X-Forwarded-For entry the client wrote itself.
+   *
+   * Unset means off, which is correct for docker-compose and local development
+   * where the port is published directly with no proxy in front.
+   */
+  const rawTrustProxy = env.TRUST_PROXY?.trim();
+  let trustProxy;
+  if (rawTrustProxy) {
+    if (/^(true|false|yes|no)$/i.test(rawTrustProxy)) {
+      throw new Error(
+        'TRUST_PROXY must be a hop count, a comma-separated proxy list, or an Express ' +
+          `preset (loopback, linklocal, uniquelocal) — got "${rawTrustProxy}". ` +
+          '"true" is forbidden: it trusts client-supplied X-Forwarded-For entries.',
+      );
+    }
+    if (/^\d+$/.test(rawTrustProxy)) {
+      trustProxy = Number(rawTrustProxy);
+    } else {
+      trustProxy = rawTrustProxy
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+    }
+  }
+
+  /**
+   * CORS policy.
+   *
+   * Origins allowed to call this service from browser JavaScript. Empty means
+   * the public read routes fall back to `*` (they carry no credential worth
+   * protecting) while the authenticated payment routes get no CORS grant at
+   * all — see app.js for why the two route classes are decided separately.
+   */
+  const corsAllowedOrigins = (env.CORS_ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean);
+
   return {
     port: Number(env.PORT ?? 3402),
+
+    /**
+     * Deployment environment. Unset in the Docker image by default; only used
+     * here to decide whether a local .env file is loaded and whether HSTS is
+     * sent. Never gate error-detail behaviour on it — see app.js.
+     */
+    nodeEnv: env.NODE_ENV ?? 'development',
+    cors: { allowedOrigins: corsAllowedOrigins },
     networks,
     perNetwork,
+    trustProxy,
+
+    /** Optional shared stores. Unset means in-memory, single-instance. */
+    redisUrl: env.REDIS_URL || null,
+    databaseUrl: env.DATABASE_URL || null,
 
     /**
      * Caller authentication. Unset means open, which is correct for a free

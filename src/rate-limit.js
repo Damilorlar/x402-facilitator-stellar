@@ -153,17 +153,16 @@ export class RateLimiter {
   }
 
   /**
-   * Catalogue writes are metered per minute. This method previously reached for
-   * `this.limits`, which never existed — every call threw. It goes through the
-   * same key config as everything else (catalogRpm), which is why it must be
-   * fixed before its state can be ported onto the shared store: porting the bug
-   * would carry it across.
+   * Catalogue writes are metered per minute (the same fix upstream landed in
+   * #240; this method previously reached for `this.limits`, which never
+   * existed, and threw on every call). Async here because bucket state lives
+   * behind the shared store (#94).
    */
   async checkCatalog(req) {
     const ownerId = req.keyId || req.ip;
     const limits = this._getKeyConfig(req.keyId);
-    const res = await this._check(ownerId, 'catalog', 60, limits.catalogRpm ?? 10);
-    if (!res.allowed && !res.reason) res.reason = 'rate_limit_exceeded';
+    const res = await this._check(ownerId, 'catalog', 60, limits.catalogRpm);
+    if (!res.allowed && !res.reason) res.reason = 'catalog_rate_limited';
     return res;
   }
 

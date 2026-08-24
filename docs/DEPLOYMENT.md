@@ -14,6 +14,52 @@ export FACILITATOR_SECRET="S..."
 docker compose up
 ```
 
+### Loading a .env file
+
+For local (non-Docker) runs, the service loads a `.env` file from the working
+directory at startup:
+
+```bash
+cp .env.example .env   # fill in FACILITATOR_SECRET
+npm start
+```
+
+Properties of this mechanism, and why it is wired this way:
+
+- **Development convenience only.** The file is loaded when `NODE_ENV` is not
+  `production`. Production has no `.env`; there the environment comes from the
+  orchestrator, so a stray `.env` left next to the image cannot shadow it.
+- **Tolerant of absence.** No file, no error — the environment stands alone.
+- **Real environment wins.** Variables already set in the environment are never
+  overridden by `.env`. A stale local file cannot silently beat what a secrets
+  manager injected.
+- **`.env` is gitignored.** `FACILITATOR_SECRET` is a signing key.
+
+### Deployment topology and client IP resolution
+
+Whether the service can see the real client IP depends on what sits in front of
+it:
+
+| Environment | Topology | `TRUST_PROXY` |
+|---|---|---|
+| Local development | Direct connection | unset |
+| docker-compose | Port published directly, no proxy | unset |
+| Hosted (TLS terminator / load balancer / ingress) | 1+ reverse-proxy hops in front | hop count or proxy list |
+
+With no proxy configured, Express's default applies: `req.ip` is the address of
+the TCP peer. That is correct when clients connect directly — and wrong behind
+a proxy, where every caller shares the proxy's address and, in open mode, one
+rate-limit bucket.
+
+When deployed behind a proxy, set `TRUST_PROXY` to the number of trusted proxy
+hops (e.g. `TRUST_PROXY=1`) or an explicit list of proxy addresses/CIDRs
+(e.g. `TRUST_PROXY=10.0.0.5,10.0.1.0/24`). The value is pinned to known
+infrastructure on purpose: `true` is rejected at boot because it trusts the
+leftmost `X-Forwarded-For` entry, which the client wrote itself and can forge.
+
+Rate limiting keys on `req.keyId || req.ip`, so getting this right is also what
+keeps open-mode callers out of each other's buckets.
+
 ### Environment Variables
 
 | Variable | Required? | Description |
@@ -27,8 +73,10 @@ docker compose up
 | `FACILITATOR_API_KEYS` | No | Comma-separated API keys. Unset means open (correct for free testnet). |
 | `ENABLE_PUBNET` | No | Set to `true` to enable pubnet. |
 | `FACILITATOR_SECRET_PUBNET`| Yes (if pubnet) | `S…` secret for the pubnet signer. |
-| `DATABASE_URL` | No | Connection string for PostgreSQL (e.g., `postgres://user:pass@host:5432/db`). Required when `RATE_LIMIT_STORE=postgres`. |
-| `RATE_LIMIT_STORE` | No | `memory` (default) or `postgres`. Shared rate-limit state across replicas — see below. |
+| `TRUST_PROXY` | No | Express trust proxy setting: hop count or proxy list (see topology above). Never `true`. |
+| `REDIS_URL` | No | Shared rate-limit buckets across instances, e.g. `redis://redis:6379`. Unset = in-memory (or `RATE_LIMIT_STORE`). Takes precedence over `RATE_LIMIT_STORE`. |
+| `DATABASE_URL` | No | Connection string for PostgreSQL (e.g., `postgres://user:pass@host:5432/db`). Enables persistent idempotency keys; required when `RATE_LIMIT_STORE=postgres`; unset otherwise = in-memory. |
+| `RATE_LIMIT_STORE` | No | `memory` (default) or `postgres`. Postgres-backed shared rate-limit state across replicas — see below. Ignored when `REDIS_URL` is set. |
 | `RPC_BREAKER_THRESHOLD` | No | Consecutive connection failures that open the RPC circuit breaker (default `10`). |
 | `RPC_BREAKER_COOLDOWN_MS` | No | How long an open breaker waits before a half-open probe (default `30000`). |
 | `READINESS_TIMEOUT_MS` | No | Per-call timeout for readiness checks, independent of the RPC retry budget (default `3000`). |
@@ -46,23 +94,26 @@ for one replica and zero-config testnet, but it has two consequences at scale:
 - **N replicas enforce N separate limits** — every caller gets N× its
   allowance.
 
-Setting `RATE_LIMIT_STORE=postgres` moves limiter state into Postgres (the
-database already provisioned by `docker-compose.yml`, via `DATABASE_URL`):
+Two shared backends are available; both make replicas enforce one combined
+limit and keep the fee ceiling alive across restarts:
 
-- two processes sharing one store enforce one combined limit;
-- the fee counter survives restarts, redeploys and reschedules;
-- increments are atomic single-statement upserts (`migrations/002_rate_limit_buckets.sql`,
+- **Redis** — set `REDIS_URL`. If Redis becomes unreachable, an instance
+  degrades to per-instance in-memory counters and logs a warning; the service
+  stays up.
+- **Postgres** — set `RATE_LIMIT_STORE=postgres` with `DATABASE_URL`. Increments
+  are atomic single-statement upserts (`migrations/002_rate_limit_buckets.sql`,
   also created automatically on first use) — no lost counts under concurrency.
+  Postgres was chosen as the second backend because it is already part of the
+  stack, and its rows are never evicted: a fee counter is a value that must not
+  be lost to an eviction policy (a Redis instance used for this table must run
+  `maxmemory-policy noeviction`).
 
-Postgres was chosen over Redis because it is already part of the stack, and
-because its rows are never evicted: a fee counter is a value that must not be
-lost to an eviction policy. If Redis is ever introduced here it must run with
-`maxmemory-policy noeviction`.
-
-**Degrade behaviour:** when the shared store is unreachable, checks fail CLOSED
-with reason `rate_limit_store_unavailable`. Fail-open would mean unlimited
-sponsored spend during an outage — exactly the bug this feature exists to
-prevent.
+**Degrade behaviour differs by backend, deliberately:** Redis-backed limiting
+fails open (the service stays up with per-instance counters); the Postgres
+store fails CLOSED — checks refuse with reason `rate_limit_store_unavailable`
+— because a limiter that cannot see its counters has no idea whether the fee
+ceiling is spent, and answering "allowed" would mean unlimited sponsored spend
+during an outage.
 
 ## Health Endpoints and Probes
 
@@ -83,6 +134,20 @@ recorded as structured JSON lines with `"channel": "audit"`, separable from
 diagnostic logs. Set `AUDIT_LOG_FILE` to mirror them to a file with its own
 retention handling. See `docs/AUDIT.md` for the event catalogue and retention.
 
+## Horizontal Scalability
+
+To run multiple instances behind a load balancer:
+
+- **Rate limits** — set `REDIS_URL` (or `RATE_LIMIT_STORE=postgres`, above), so
+  limits mean the same thing regardless of which node handled the request.
+- **Idempotency** — set `DATABASE_URL`. Settlement retries are deduplicated via
+  a Postgres table with a unique constraint, so a retry routed to a different
+  instance replays the recorded response instead of settling twice. If Postgres
+  is unavailable, idempotency degrades to process-local with a loud warning.
+- **Catalog** — still per-instance in-memory; see Known Gaps.
+
+The docker-compose file ships the backing services and wires the URLs.
+
 ## Secret Handling
 
 The `FACILITATOR_SECRET` and `FACILITATOR_SECRET_PUBNET` are highly privileged keys. 
@@ -102,10 +167,18 @@ The default `@x402/stellar` package relies on the public Stellar testnet RPC. Th
 
 ## Database Provisioning and Migration
 
-*(Note: Database persistence is planned for durable settlement in #10 and catalog indexing in #20.)*
+When `DATABASE_URL` is set, the database must be provisioned (PostgreSQL 16+)
+and migrated before the main facilitator process binds to the port, so the
+schema is ready when the first settlement arrives:
 
-When deploying, the database must be provisioned (PostgreSQL 16+) and connected via `DATABASE_URL`.
-Migrations will be automatically applied on deploy (or handled by an init container) before the main facilitator process binds to the port to ensure the schema is ready.
+```bash
+psql "$DATABASE_URL" -f migrations/001_bazaar_catalog.sql
+psql "$DATABASE_URL" -f migrations/002_idempotency_keys.sql
+```
+
+Migrations are applied on deploy (or handled by an init container). They are
+forward-compatible: each creates its tables/indexes if absent and touches
+nothing else.
 
 ## Resource Sizing
 

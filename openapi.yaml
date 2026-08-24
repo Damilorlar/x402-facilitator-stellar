@@ -212,6 +212,8 @@ paths:
       security:
         - ApiKeyAuth: []
         - {}
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -557,6 +559,17 @@ components:
         type: array
         items:
           type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Makes `/settle` exactly-once per key: retrying with the same key
+        replays the recorded response instead of settling again. When absent,
+        the key is derived from the request body. Backed by Postgres when
+        `DATABASE_URL` is set; process-local otherwise.
+      schema:
+        type: string
 
   responses:
     Unauthorized:
