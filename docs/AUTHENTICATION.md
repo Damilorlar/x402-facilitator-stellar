@@ -48,3 +48,25 @@ If `FACILITATOR_API_KEYS` is unset or empty, the facilitator runs in **open mode
 This means all routes are unauthenticated. The server logs a loud warning at boot when running in this mode.
 
 Open mode is acceptable (and often desired) for **public testnet deployments** to allow frictionless developer onboarding. It is strongly discouraged on pubnet, where unauthenticated callers can drain the signer's funds by submitting valid but abusive transactions.
+
+## CORS
+
+Cross-origin access is decided **per route class**, because the two classes carry opposite risk:
+
+| Route class | Routes | Default policy |
+| --- | --- | --- |
+| Public reads | `GET /supported`, `GET /discovery/resources`, `GET /discovery/search` (and `/healthz`) | Any origin. These are unauthenticated and carry no credential worth protecting — a browser-based agent or catalog explorer needs them. |
+| Authenticated | `POST /verify`, `POST /settle`, `GET /usage`, `POST /discovery/resources` | **No grant by default.** These routes carry an API key; a permissive policy would let any web page send a caller's key somewhere it should not go. |
+
+Allowed origins for the authenticated class are configured via `CORS_ALLOWED_ORIGINS` as a comma-separated list:
+
+```
+CORS_ALLOWED_ORIGINS=https://resource-server.example.com,https://dashboard.example.com
+```
+
+When set, the list also narrows the public reads to exactly those origins instead of `*`.
+
+Notes:
+
+- `Authorization` is not a CORS-safelisted request header, so every browser call to `/verify` or `/settle` triggers a preflight (`OPTIONS`). The preflight is answered with `Authorization` and `Content-Type` in `Access-Control-Allow-Headers`; without a grant the browser blocks the actual request.
+- `RateLimit-*`, `Retry-After` and `EXTENSION-RESPONSES` are named in `Access-Control-Expose-Headers`, so rate-limit state and the Bazaar cataloguing outcome are readable from browser JavaScript.

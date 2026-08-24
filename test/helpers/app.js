@@ -15,8 +15,15 @@ import { createApp } from '../../src/app.js';
  * API keys are given as `id:secret` and hashed here the way resolveConfig does,
  * so a test states the secret it will present rather than a digest.
  */
-export function testConfig({ apiKeys = [], networks = ['stellar:testnet'] } = {}) {
+export function testConfig({
+  apiKeys = [],
+  networks = ['stellar:testnet'],
+  corsAllowedOrigins = [],
+  nodeEnv = 'development',
+} = {}) {
   return {
+    nodeEnv,
+    cors: { allowedOrigins: corsAllowedOrigins },
     apiKeys: apiKeys.map(entry => {
       const idx = entry.indexOf(':');
       const [id, secret] = idx > 0 ? [entry.slice(0, idx), entry.slice(idx + 1)] : ['key_0', entry];
@@ -85,9 +92,16 @@ export function stubCatalog(overrides = {}) {
   };
 }
 
-export async function serve({ config, facilitator, rateLimiter, catalog } = {}) {
+export async function serve({
+  config,
+  facilitator,
+  rateLimiter,
+  catalog,
+  corsAllowedOrigins,
+  nodeEnv,
+} = {}) {
   const app = createApp(
-    config ?? testConfig(),
+    config ?? testConfig({ corsAllowedOrigins, nodeEnv }),
     facilitator ?? stubFacilitator(),
     rateLimiter ?? stubRateLimiter(),
     catalog ?? stubCatalog(),
@@ -107,6 +121,7 @@ export async function serve({ config, facilitator, rateLimiter, catalog } = {}) 
         headers: { 'content-type': 'application/json', ...headers },
         body: typeof body === 'string' ? body : JSON.stringify(body),
       }),
+    request: (path, options = {}) => fetch(`${base}${path}`, options),
   };
 }
 
