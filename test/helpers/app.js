@@ -84,12 +84,13 @@ export function stubCatalog(overrides = {}) {
   };
 }
 
-export async function serve({ config, facilitator, rateLimiter, catalog } = {}) {
+export async function serve({ config, facilitator, rateLimiter, catalog, extras } = {}) {
   const app = createApp(
     config ?? testConfig(),
     facilitator ?? stubFacilitator(),
     rateLimiter ?? stubRateLimiter(),
     catalog ?? stubCatalog(),
+    extras,
   );
 
   const server = app.listen(0);

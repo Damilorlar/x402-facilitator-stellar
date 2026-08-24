@@ -47,6 +47,7 @@
     "@x402/core": "^2.21.0",
     "@x402/stellar": "^2.21.0",
     "express": "^5.2.1",
+    "pg": "^8.23.0",
     "undici": "^7.29.0"
   },
   "devDependencies": {
