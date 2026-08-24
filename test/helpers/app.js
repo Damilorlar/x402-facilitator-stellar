@@ -18,10 +18,12 @@ import { createApp } from '../../src/app.js';
 export function testConfig({
   apiKeys = [],
   networks = ['stellar:testnet'],
+  trustProxy,
   corsAllowedOrigins = [],
   nodeEnv = 'development',
 } = {}) {
   return {
+    trustProxy,
     nodeEnv,
     cors: { allowedOrigins: corsAllowedOrigins },
     apiKeys: apiKeys.map(entry => {
@@ -97,6 +99,7 @@ export async function serve({
   facilitator,
   rateLimiter,
   catalog,
+  idempotency,
   corsAllowedOrigins,
   nodeEnv,
 } = {}) {
@@ -105,6 +108,7 @@ export async function serve({
     facilitator ?? stubFacilitator(),
     rateLimiter ?? stubRateLimiter(),
     catalog ?? stubCatalog(),
+    idempotency,
   );
 
   const server = app.listen(0);

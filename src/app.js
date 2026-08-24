@@ -41,10 +41,19 @@ import { requestLogger } from './logger.js';
  * @param {{verify: Function, settle: Function, getSupported: Function}} facilitator
  * @param {object} rateLimiter - RateLimiter, or a stub with the same surface
  * @param {{upsertResource: Function, listResources: Function}} catalog
+ * @param {{keyFor: Function, begin: Function, complete: Function}} [idempotency]
+ *   optional idempotency store for /settle; absent means in-memory only
  * @returns {import('express').Express}
  */
-export function createApp(config, facilitator, rateLimiter, catalog) {
+export function createApp(config, facilitator, rateLimiter, catalog, idempotency) {
   const app = express();
+  // Client IP resolution. Unset leaves Express's default (off), correct where
+  // the port is published directly — local development and docker-compose.
+  // Never "true": that trusts the leftmost X-Forwarded-For entry the client
+  // wrote itself. See docs/DEPLOYMENT.md for the topology per environment.
+  if (config.trustProxy !== undefined) {
+    app.set('trust proxy', config.trustProxy);
+  }
   app.use(express.json({ limit: '256kb' }));
   // Redacts Authorization/cookie/*_secret before anything hits the log — see
   // src/logger.js. Never logs the body: paymentPayload/paymentRequirements
@@ -162,7 +171,7 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
    * payment response returns immediately. A cataloging failure is logged, never
    * surfaced as a payment failure.
    */
-  function processCataloging(req, body, res, source = 'payment') {
+  async function processCataloging(req, body, res, source = 'payment') {
     const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
     const outcome = {};
 
@@ -175,7 +184,7 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
         console.warn(`[Catalog] Hard drop: ${validation.reason}`);
       }
     } else {
-      const checkResult = rateLimiter.checkCatalog(req);
+      const checkResult = await rateLimiter.checkCatalog(req);
       if (!checkResult.allowed) {
         outcome.status = 'rejected';
         outcome.code = 'catalog_rate_limited';
@@ -194,7 +203,7 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
           outcome.code = 'catalog_success';
         }
 
-        rateLimiter.recordCatalog(req);
+        await rateLimiter.recordCatalog(req);
 
         // Off the hot path. Cataloging must never delay or fail a payment.
         Promise.resolve().then(async () => {
@@ -327,22 +336,22 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
     res.json(facilitator.getSupported());
   });
 
-  app.get('/usage', requireApiKeyStrict, (req, res) => {
-    res.json(rateLimiter.getUsage(req.keyId));
+  app.get('/usage', requireApiKeyStrict, async (req, res) => {
+    res.json(await rateLimiter.getUsage(req.keyId));
   });
 
   app.post('/verify', cors('authenticated'), requireApiKey, async (req, res) => {
-    const check = rateLimiter.checkVerify(req);
+    const check = await rateLimiter.checkVerify(req);
     if (!check.allowed) return handleRateLimit(res, check);
 
     const body = readPaymentBody(req, res);
     if (!body) return;
     try {
-      rateLimiter.recordVerify(req);
+      await rateLimiter.recordVerify(req);
       handleRateLimit(res, check);
       const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
       if (result.isValid) {
-        processCataloging(req, body, res, 'payment');
+        await processCataloging(req, body, res, 'payment');
       }
       res.json(result);
     } catch (err) {
@@ -364,17 +373,30 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
   });
 
   app.post('/settle', cors('authenticated'), requireApiKey, async (req, res) => {
-    const check = rateLimiter.checkSettle(req);
+    const check = await rateLimiter.checkSettle(req);
     if (!check.allowed) return handleRateLimit(res, check);
 
     const body = readPaymentBody(req, res, 'settle');
     if (!body) return;
+
+    // Exact-once settlement: a repeated idempotency key replays the recorded
+    // response instead of touching the chain again. The key is client-supplied
+    // when present and derived from the request body otherwise.
+    const replay = idempotency ? await idempotency.begin(idempotency.keyFor(req)) : null;
+    if (replay?.replayed) {
+      handleRateLimit(res, check);
+      return res.status(replay.statusCode).json(replay.response);
+    }
+
     try {
       const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
-      rateLimiter.recordSettle(req, result.success ? result.transactionFeeStroops || 0 : 0);
+      await rateLimiter.recordSettle(req, result.success ? result.transactionFeeStroops || 0 : 0);
       handleRateLimit(res, check);
       if (result.success) {
-        processCataloging(req, body, res, 'payment');
+        await processCataloging(req, body, res, 'payment');
+      }
+      if (idempotency && replay) {
+        await idempotency.complete(replay.key, 200, result);
       }
       res.json(result);
     } catch (err) {
@@ -400,7 +422,7 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
     const body = readPaymentBody(req, res);
     if (!body) return;
 
-    const check = rateLimiter.checkCatalog(req);
+    const check = await rateLimiter.checkCatalog(req);
     if (!check.allowed) return handleRateLimit(res, check);
 
     const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
@@ -408,7 +430,7 @@ export function createApp(config, facilitator, rateLimiter, catalog) {
       return res.status(400).json({ error: 'invalid_resource', reason: validation.reason });
     }
 
-    rateLimiter.recordCatalog(req);
+    await rateLimiter.recordCatalog(req);
     try {
       const entry = await catalog.upsertResource(validation.resource, 'manual');
       res.json({ ok: true, resource: entry, softDrops: validation.softDrops });
