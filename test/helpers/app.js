@@ -104,6 +104,7 @@ export async function serve({
   webhooks,
   corsAllowedOrigins,
   nodeEnv,
+  extras,
 } = {}) {
   const app = createApp(
     config ?? testConfig({ corsAllowedOrigins, nodeEnv }),
@@ -111,8 +112,7 @@ export async function serve({
     rateLimiter ?? stubRateLimiter(),
     catalog ?? stubCatalog(),
     idempotency,
-    distributedLock ?? null,
-    webhooks ?? null,
+    { distributedLock, webhooks, ...extras },
   );
 
   // Fastify's listen resolves with the bound address once the server is up.

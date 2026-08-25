@@ -1,10 +1,38 @@
 /**
- * In-memory sliding-window (or fixed-window) rate limiter and usage meter.
+ * Sliding-window (fixed-window) rate limiter and usage meter.
+ *
+ * Issue #94: bucket state lives behind a store interface (src/rate-limit-store.js)
+ * instead of a per-process Map. With no configuration the store is in-memory
+ * and behaviour is exactly what it was before; with RATE_LIMIT_STORE=postgres
+ * the buckets are shared, so two replicas enforce one combined limit and the
+ * daily fee ceiling survives a restart.
+ *
+ * DEGRADE DECISION — fail closed when a shared store is configured and
+ * unreachable. A limiter that cannot read its counters has no idea whether the
+ * daily fee ceiling has been spent; failing open there re-creates the exact bug
+ * this issue fixes (unbounded sponsored spend), so checks refuse with the
+ * distinct reason 'rate_limit_store_unavailable' until the store answers
+ * again. The default memory store cannot be unreachable, so an unconfigured
+ * instance never sees this path.
+ *
+ * Records (recordSettle etc.) are the one place that degrades open: they run
+ * after the payment has already succeeded, and throwing would turn a settled
+ * payment into a 5xx. A lost record is logged loudly instead — and because the
+ * preceding check failed closed while the store was down, a sustained outage
+ * does not accumulate uncounted spend.
  */
+import { MemoryStore } from './rate-limit-store.js';
+
 export class RateLimiter {
-  constructor(config) {
+  /**
+   * @param {object} config - { global: {...}, keys: {...} } limits
+   * @param {{get: Function, increment: Function, sweep: Function}} [store]
+   *   Defaults to in-process memory. Pass a shared store to enforce combined
+   *   limits across replicas; two limiters pointed at one store behave as one.
+   */
+  constructor(config, store = new MemoryStore()) {
     this.config = config;
-    this.store = new Map(); // Map<string, { count, resetAt }>
+    this.store = store;
   }
 
   _getKeyConfig(keyId) {
@@ -17,83 +45,96 @@ export class RateLimiter {
     return `${ownerId}:${type}:${windowStart}:${windowSec}`;
   }
 
-  _increment(ownerId, type, windowSec, amount = 1) {
-    const bucketId = this._getBucketId(ownerId, type, windowSec);
+  async _increment(ownerId, type, windowSec, amount = 1) {
     const now = Math.floor(Date.now() / 1000);
-    const windowStart = now - (now % windowSec);
-    const resetAt = windowStart + windowSec;
-
-    let bucket = this.store.get(bucketId);
-    if (!bucket) {
-      bucket = { count: 0, resetAt };
-      this.store.set(bucketId, bucket);
-    }
-    bucket.count += amount;
-
-    // cleanup old buckets periodically (simple approach: every request we might sweep, but for now just rely on TTL logic if persistence is added, or sweep manually)
-    if (Math.random() < 0.05) this._sweep(now);
-
-    return bucket;
-  }
-
-  _check(ownerId, type, windowSec, limit, amount = 1) {
     const bucketId = this._getBucketId(ownerId, type, windowSec);
-    const bucket = this.store.get(bucketId) || {
-      count: 0,
-      resetAt: Math.floor(Date.now() / 1000) + windowSec,
-    };
-    if (bucket.count + amount > limit) {
-      return { allowed: false, limit, remaining: 0, resetAt: bucket.resetAt };
-    }
-    return {
-      allowed: true,
-      limit,
-      remaining: limit - bucket.count - amount,
-      resetAt: bucket.resetAt,
-    };
-  }
+    const resetAt = now - (now % windowSec) + windowSec;
 
-  _sweep(now) {
-    for (const [id, bucket] of this.store.entries()) {
-      if (bucket.resetAt <= now) {
-        this.store.delete(id);
-      }
+    try {
+      const bucket = await this.store.increment(bucketId, amount, resetAt, now);
+      // cleanup old buckets periodically
+      if (Math.random() < 0.05) await this._sweep(now);
+      return bucket;
+    } catch (err) {
+      console.error(`[RateLimit] store increment failed (${err.message}) — count not recorded`);
+      return { count: NaN, resetAt };
     }
   }
 
-  checkVerify(req) {
+  /**
+   * Reads current usage without consuming anything. Any store failure fails
+   * CLOSED: see the degrade decision at the top of this file.
+   */
+  async _check(ownerId, type, windowSec, limit, amount = 1) {
+    const now = Math.floor(Date.now() / 1000);
+    const bucketId = this._getBucketId(ownerId, type, windowSec);
+
+    let bucket;
+    try {
+      bucket = await this.store.get(bucketId, now);
+    } catch {
+      return {
+        allowed: false,
+        limit,
+        remaining: 0,
+        resetAt: now + windowSec,
+        reason: 'rate_limit_store_unavailable',
+      };
+    }
+    const resetAt = bucket?.resetAt ?? now - (now % windowSec) + windowSec;
+    const count = bucket?.count ?? 0;
+    if (count + amount > limit) {
+      return { allowed: false, limit, remaining: 0, resetAt };
+    }
+    return { allowed: true, limit, remaining: limit - count - amount, resetAt };
+  }
+
+  async _sweep(now) {
+    try {
+      await this.store.sweep(now);
+    } catch {
+      // Sweep is pure housekeeping; the next request retries it. An empty
+      // catch is normally banned here — this one is the deliberate exception:
+      // sweeping must never be able to take down a request that already
+      // passed its limit check.
+    }
+  }
+
+  async checkVerify(req) {
     const ownerId = req.keyId || req.ip;
     const limits = this._getKeyConfig(req.keyId);
-    const res = this._check(ownerId, 'verify', 60, limits.verifyRpm);
-    if (!res.allowed) res.reason = 'rate_limit_exceeded';
+    const res = await this._check(ownerId, 'verify', 60, limits.verifyRpm);
+    if (!res.allowed && !res.reason) res.reason = 'rate_limit_exceeded';
     return res;
   }
 
-  recordVerify(req) {
+  async recordVerify(req) {
     const ownerId = req.keyId || req.ip;
-    this._increment(ownerId, 'verify', 60, 1);
+    await this._increment(ownerId, 'verify', 60, 1);
   }
 
-  checkSettle(req) {
+  async checkSettle(req) {
     const ownerId = req.keyId || req.ip;
     const limits = this._getKeyConfig(req.keyId);
 
     // Check all three limits for settle
     const checks = [
-      this._check(ownerId, 'settle', 60, limits.settleRpm),
-      this._check(ownerId, 'settle', 3600, limits.settleRph),
-      this._check(ownerId, 'settle', 86400, limits.settleRpd),
+      await this._check(ownerId, 'settle', 60, limits.settleRpm),
+      await this._check(ownerId, 'settle', 3600, limits.settleRph),
+      await this._check(ownerId, 'settle', 86400, limits.settleRpd),
     ];
 
     for (const c of checks) {
-      if (!c.allowed) return { ...c, reason: 'rate_limit_exceeded' };
+      if (!c.allowed) return { ...c, reason: c.reason || 'rate_limit_exceeded' };
     }
 
     // Check fee limit
     // We can't strictly check fee before settlement unless we assume maxTransactionFeeStroops.
     // We will check if the current consumed + 0 is > limits.feeSpd (or maxTransactionFeeStroops).
-    const feeCheck = this._check(ownerId, 'fee', 86400, limits.feeSpd, 0); // just checking current
-    if (!feeCheck.allowed) return { ...feeCheck, reason: 'fee_ceiling_exceeded' };
+    const feeCheck = await this._check(ownerId, 'fee', 86400, limits.feeSpd, 0); // just checking current
+    if (!feeCheck.allowed) {
+      return { ...feeCheck, reason: feeCheck.reason || 'fee_ceiling_exceeded' };
+    }
 
     // Return the tightest limit for headers
     return checks.reduce((tightest, current) =>
@@ -101,41 +142,54 @@ export class RateLimiter {
     );
   }
 
-  recordSettle(req, feeCharged) {
+  async recordSettle(req, feeCharged) {
     const ownerId = req.keyId || req.ip;
-    this._increment(ownerId, 'settle', 60, 1);
-    this._increment(ownerId, 'settle', 3600, 1);
-    this._increment(ownerId, 'settle', 86400, 1);
+    await this._increment(ownerId, 'settle', 60, 1);
+    await this._increment(ownerId, 'settle', 3600, 1);
+    await this._increment(ownerId, 'settle', 86400, 1);
     if (feeCharged) {
-      this._increment(ownerId, 'fee', 86400, feeCharged);
+      await this._increment(ownerId, 'fee', 86400, feeCharged);
     }
   }
 
-  checkCatalog(req) {
+  /**
+   * Catalogue writes are metered per minute (the same fix upstream landed in
+   * #240; this method previously reached for `this.limits`, which never
+   * existed, and threw on every call). Async here because bucket state lives
+   * behind the shared store (#94).
+   */
+  async checkCatalog(req) {
     const ownerId = req.keyId || req.ip;
     const limits = this._getKeyConfig(req.keyId);
-    const res = this._check(ownerId, 'catalog', 60, limits.catalogRpm);
-    if (!res.allowed) res.reason = 'catalog_rate_limited';
+    const res = await this._check(ownerId, 'catalog', 60, limits.catalogRpm);
+    if (!res.allowed && !res.reason) res.reason = 'catalog_rate_limited';
     return res;
   }
 
-  recordCatalog(req) {
+  async recordCatalog(req) {
     const ownerId = req.keyId || req.ip;
-    this._increment(ownerId, 'catalog', 60, 1);
+    await this._increment(ownerId, 'catalog', 60, 1);
   }
 
-  getUsage(keyId) {
+  async getUsage(keyId) {
     const ownerId = keyId; // IP usage is not exposed via GET /usage, only key usage
-    const getCount = (type, windowSec) => {
-      const bucketId = this._getBucketId(ownerId, type, windowSec);
-      return this.store.get(bucketId)?.count || 0;
+    const getCount = async (type, windowSec, fallback) => {
+      const now = Math.floor(Date.now() / 1000);
+      try {
+        const bucket = await this.store.get(this._getBucketId(ownerId, type, windowSec), now);
+        return bucket?.count ?? 0;
+      } catch {
+        // Usage reporting is informational; a dead shared store must not turn
+        // GET /usage into a 500. Report the last known zero rather than fail.
+        return fallback;
+      }
     };
     return {
-      verify_rpm: getCount('verify', 60),
-      settle_rpm: getCount('settle', 60),
-      settle_rph: getCount('settle', 3600),
-      settle_rpd: getCount('settle', 86400),
-      fee_spd: getCount('fee', 86400),
+      verify_rpm: await getCount('verify', 60),
+      settle_rpm: await getCount('settle', 60),
+      settle_rph: await getCount('settle', 3600),
+      settle_rpd: await getCount('settle', 86400),
+      fee_spd: await getCount('fee', 86400),
     };
   }
 }

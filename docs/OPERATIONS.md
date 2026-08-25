@@ -1,6 +1,47 @@
 # Operations & Rate Limiting
 
-The x402 facilitator includes an in-memory sliding-window rate limiter and usage meter. This protects the service from abuse and limits the cumulative fee exposure, as the service sponsors Stellar transaction fees for every settlement.
+The x402 facilitator includes a sliding-window rate limiter and usage meter. This protects the service from abuse and limits the cumulative fee exposure, as the service sponsors Stellar transaction fees for every settlement.
+
+## Health Endpoints
+
+Two endpoints, two different questions — keep them straight:
+
+### `GET /healthz` — liveness
+
+Always returns `200 { ok: true }` while the process runs. It performs **no
+dependency checks**, deliberately: a liveness probe that fails on a downstream
+outage triggers restart loops that make the outage worse (and a restart cannot
+fix someone else's RPC). The Docker `HEALTHCHECK` targets this endpoint.
+
+### `GET /health/ready` — readiness
+
+Returns `200 { status: "ready", ... }` when the instance can settle right now,
+or `503 { ok: false, status: "not_ready", networks: {...} }` naming which check
+failed for which network. Per configured network it checks:
+
+| Check | Meaning of failure |
+|---|---|
+| `rpc_reachable` | The network's Soroban RPC did not answer a bounded getHealth call. Every `/settle` will currently fail; stop routing traffic here. |
+| `signer_funded` | The facilitator signer account does not exist or is below `READINESS_FUNDING_FLOOR_STROOPS`. No settlement can be sponsored. Fund the account or fix the signer config. |
+
+The response also reports, without ever failing on them:
+- `breakers` — per-RPC-host circuit-breaker state (`open` means calls are being refused fast; see #105);
+- `catalog` — catalogue-store health. A cataloguing failure must never fail a payment, so it never fails readiness either.
+
+Results are cached for `READINESS_CACHE_TTL_MS` (default 5s) so probes do not
+become an RPC burst, and every underlying call runs under its own
+`READINESS_TIMEOUT_MS` (default 3s) rather than inheriting the payment path's
+~12s retry budget.
+
+**Probe wiring rule:** restart logic → `/healthz`; traffic gating (load
+balancers, Kubernetes `readinessProbe`) → `/health/ready`.
+
+## Rate Limit Store
+
+Counters live in process memory by default (`RATE_LIMIT_STORE` unset). For
+multi-replica deployments set `RATE_LIMIT_STORE=postgres` with `DATABASE_URL`
+so all replicas share one combined limit and the daily fee ceiling survives
+restarts — see docs/DEPLOYMENT.md ("Shared Rate-Limit State").
 
 ## Configuration
 

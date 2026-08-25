@@ -1,5 +1,6 @@
 /**
- * The HTTP surface: /verify, /settle, /supported, /usage, /discovery/resources.
+ * The HTTP surface: /verify, /settle, /supported, /usage, /discovery/resources,
+ * /healthz, /health/ready.
  *
  * @x402/core ships no facilitator router — it gives you x402Facilitator with
  * verify(), settle() and getSupported(), and the transport is yours. This file
@@ -35,6 +36,8 @@
 import crypto from 'node:crypto';
 import Fastify from 'fastify';
 import { validateForCatalog } from './catalog/validation.js';
+import { createAuditLogger } from './audit.js';
+import { createReadinessChecker } from './readiness.js';
 import { validatePaymentBody } from './request-validation.js';
 import { requestLogger } from './logger.js';
 import { lockKeyFor } from './distributed-lock.js';
@@ -84,21 +87,16 @@ const PAYMENT_BODY_SCHEMA = {
  * @param {{upsertResource: Function, listResources: Function}} catalog
  * @param {{keyFor: Function, begin: Function, complete: Function}} [idempotency]
  *   optional idempotency store for /settle; absent means in-memory only
- * @param {{withLock: Function}} [distributedLock] - optional Redlock-backed
- *   distributed lock (#116); absent means no cross-process serialization
- * @param {{enqueue: Function}} [webhooks] - optional asynchronous webhook
- *   dispatcher (#117); absent means no webhook notifications are sent
+ * @param {object} [extras] - optional collaborators:
+ *   - distributedLock (#116): Redlock-backed lock for state transitions
+ *   - webhooks (#117): asynchronous webhook dispatcher
+ *   - audit: audit writer override (default createAuditLogger)
+ *   - readiness: readiness checker override
+ *   - breakerStates: breaker-state reader for the readiness probe (#105)
  * @returns {import('fastify').FastifyInstance}
  */
-export function createApp(
-  config,
-  facilitator,
-  rateLimiter,
-  catalog,
-  idempotency,
-  distributedLock = null,
-  webhooks = null,
-) {
+export function createApp(config, facilitator, rateLimiter, catalog, idempotency, extras = {}) {
+  const { distributedLock = null, webhooks = null } = extras;
   const app = Fastify({
     // Client IP resolution. Unset leaves Fastify's default (off), correct where
     // the port is published directly — local development and docker-compose.
@@ -134,6 +132,21 @@ export function createApp(
    */
   const logRequest = requestLogger();
   app.addHook('onRequest', (req, reply, done) => logRequest(req.raw, reply.raw, done));
+
+  const audit = extras.audit ?? createAuditLogger();
+
+  // Readiness defaults to a real checker over the resolved config. A bare
+  // config (tests) carries no per-network signer/RPC data, in which case the
+  // probe reports honestly that it has nothing to check rather than pretending
+  // to be ready.
+  const readiness =
+    extras.readiness ??
+    (Array.isArray(config.networks) && config.perNetwork
+      ? createReadinessChecker(config, {
+          breakerStates: extras.breakerStates ?? (() => null),
+          catalog,
+        })
+      : null);
 
   /**
    * Security headers (#86), hand-set rather than via helmet.
@@ -267,9 +280,9 @@ export function createApp(
   /**
    * Catalogs a resource declared in a payment, off the hot path.
    *
-   * Cataloging must never delay or fail a payment: the work is enqueued and the
-   * payment response returns immediately. A cataloging failure is logged, never
-   * surfaced as a payment failure.
+   * Cataloging must never delay or fail a payment: the expensive work is
+   * enqueued and the payment response returns immediately. A cataloging failure
+   * is logged, never surfaced as a payment failure.
    */
   async function processCataloging(req, body, reply, source = 'payment') {
     const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
@@ -290,6 +303,14 @@ export function createApp(
         outcome.code = 'catalog_rate_limited';
         outcome.reason = checkResult.reason;
         console.warn(`[Catalog] Rate limit exceeded for IP ${req.ip}`);
+        // Audited as a rejection but never allowed to shape the payment
+        // response: the 429/headers belong to the payment limiter, not here.
+        audit('rate_limit_rejected', {
+          actor: req.keyId ?? `ip:${req.ip}`,
+          route: 'catalog',
+          reason: checkResult.reason,
+          outcome_override: outcome.code,
+        });
       } else {
         if (validation.softDrops.length > 0) {
           outcome.status = 'partially landed';
@@ -308,7 +329,21 @@ export function createApp(
         // Off the hot path. Cataloging must never delay or fail a payment.
         Promise.resolve().then(async () => {
           try {
+            const existing = await catalog.getResource?.(
+              validation.resource.url,
+              validation.resource.toolName ?? null,
+            );
             await catalog.upsertResource(validation.resource, source);
+            // A public listing being created or overwritten is public state
+            // changing — recorded so a spoofed listing can be investigated
+            // after the fact.
+            audit('catalog_write', {
+              actor: req.keyId ?? `ip:${req.ip}`,
+              source,
+              url: validation.resource.url,
+              tool_name: validation.resource.toolName ?? null,
+              overwritten: Boolean(existing),
+            });
           } catch (err) {
             console.warn(`[Catalog] Async cataloging failed: ${err.message}`);
           }
@@ -332,11 +367,14 @@ export function createApp(
   async function requireApiKey(req, reply) {
     if (config.apiKeys.length === 0) return;
 
+    // The presented key material itself is deliberately never recorded.
+    const reject = reason => {
+      audit('auth_failure', { actor: `ip:${req.ip}`, reason });
+      reply.code(401).send({ error: 'unauthorized', reason });
+    };
+
     const authHeader = req.headers.authorization;
-    if (!authHeader) {
-      reply.code(401).send({ error: 'unauthorized', reason: 'missing_auth_header' });
-      return;
-    }
+    if (!authHeader) return reject('missing_auth_header');
 
     let presentedKey = '';
     if (authHeader.startsWith('Bearer ')) {
@@ -344,12 +382,12 @@ export function createApp(
     } else if (!authHeader.includes(' ')) {
       presentedKey = authHeader;
     } else {
-      reply.code(401).send({ error: 'unauthorized', reason: 'malformed_auth_header' });
+      reject('malformed_auth_header');
       return;
     }
 
     if (!presentedKey || presentedKey.includes(' ')) {
-      reply.code(401).send({ error: 'unauthorized', reason: 'malformed_auth_header' });
+      reject('malformed_auth_header');
       return;
     }
 
@@ -365,7 +403,7 @@ export function createApp(
       }
     }
 
-    reply.code(401).send({ error: 'unauthorized', reason: 'invalid_api_key' });
+    reject('invalid_api_key');
   }
 
   /**
@@ -377,6 +415,17 @@ export function createApp(
       return;
     }
     return requireApiKey(req, reply);
+  }
+
+  /** Rate-limit rejections are auditable: they are abuse signals, not noise. */
+  function rejectRateLimited(req, reply, route, checkResult, extra = {}) {
+    audit('rate_limit_rejected', {
+      actor: req.keyId ?? `ip:${req.ip}`,
+      route,
+      reason: checkResult.reason,
+      ...extra,
+    });
+    return handleRateLimit(reply, checkResult);
   }
 
   function handleRateLimit(reply, checkResult) {
@@ -453,6 +502,30 @@ export function createApp(
   app.get('/healthz', async () => ({ ok: true }));
 
   /**
+   * GET /health/ready — the readiness probe (#100).
+   *
+   * Unlike /healthz this CAN fail: 503 names which check failed for which
+   * network. Result is cached and bounded by its own timeout — see
+   * src/readiness.js. Catalogue trouble is reported but never fails readiness:
+   * a cataloguing failure must never fail a payment.
+   */
+  app.get('/health/ready', async (_req, reply) => {
+    if (!readiness) {
+      return reply.code(503).send({
+        ok: false,
+        status: 'not_ready',
+        reason: 'readiness_not_configured',
+      });
+    }
+    try {
+      const report = await readiness.check();
+      return reply.code(report.ok ? 200 : 503).send(report);
+    } catch (err) {
+      return reply.code(503).send({ ok: false, status: 'not_ready', error: err.message });
+    }
+  });
+
+  /**
    * GET /supported
    *
    * Must emit the Stellar `extra` block including areFeesSponsored — an explicit
@@ -475,7 +548,7 @@ export function createApp(
     },
     async (req, reply) => {
       const check = await rateLimiter.checkVerify(req);
-      if (!check.allowed) return handleRateLimit(reply, check);
+      if (!check.allowed) return rejectRateLimited(req, reply, '/verify', check);
 
       const body = readPaymentBody(req, reply);
       if (!body) return reply;
@@ -483,6 +556,12 @@ export function createApp(
         await rateLimiter.recordVerify(req);
         handleRateLimit(reply, check);
         const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
+        audit('verification', {
+          actor: req.keyId ?? `ip:${req.ip}`,
+          outcome: result.isValid ? 'valid' : 'invalid',
+          invalid_reason: result.invalidReason ?? null,
+          network: body.paymentRequirements.network,
+        });
         if (result.isValid) {
           await processCataloging(req, body, reply, 'payment');
         }
@@ -497,9 +576,17 @@ export function createApp(
         // this path only catches failures above the scheme — an unregistered
         // scheme/network pair, for instance. A distinct code keeps the two
         // distinguishable to a client.
+        //
+        // An open RPC breaker gets its own code so a caller can tell "the chain
+        // is unreachable" from "your payment was rejected" (#105, #6).
+        const invalidReason =
+          err?.code === 'RPC_BREAKER_OPEN' ? 'soroban_rpc_unreachable' : 'facilitator_error';
+        if (invalidReason !== 'facilitator_error') {
+          audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'verify' });
+        }
         return reply.send({
           isValid: false,
-          invalidReason: 'facilitator_error',
+          invalidReason,
           invalidMessage: err instanceof Error ? err.message : String(err),
         });
       }
@@ -516,7 +603,7 @@ export function createApp(
     },
     async (req, reply) => {
       const check = await rateLimiter.checkSettle(req);
-      if (!check.allowed) return handleRateLimit(reply, check);
+      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
 
       const body = readPaymentBody(req, reply, 'settle');
       if (!body) return reply;
@@ -574,6 +661,17 @@ export function createApp(
           if (idempotency && replay) {
             await idempotency.complete(replay.key, 200, result);
           }
+
+          // Settlements are THE auditable record: which authenticated caller moved
+          // money, and the transaction hash to reconstruct it by.
+          audit('settlement', {
+            actor: req.keyId ?? `ip:${req.ip}`,
+            outcome: result.success ? 'settled' : 'failed',
+            transaction: result.transaction || null,
+            network: result.network ?? body.paymentRequirements.network,
+            fee_stroops: result.success ? result.transactionFeeStroops || 0 : 0,
+            error_reason: result.errorReason ?? null,
+          });
           return result;
         };
 
@@ -584,12 +682,20 @@ export function createApp(
       } catch (err) {
         // SettleResponse requires `transaction` and `network` even on failure, so
         // a client can attribute the failure without correlating out of band.
+        //
+        // A lock that never freed under healthy Redis gets its own code (#116),
+        // and an open RPC breaker gets its own code so a caller can tell "the
+        // chain is unreachable" from "your payment was rejected" (#105, #6).
+        let errorReason = 'facilitator_error';
+        if (err instanceof Error && err.name === 'LockAcquireTimeoutError') {
+          errorReason = 'lock_timeout';
+        } else if (err?.code === 'RPC_BREAKER_OPEN') {
+          errorReason = 'soroban_rpc_unreachable';
+          audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'settle' });
+        }
         return reply.send({
           success: false,
-          errorReason:
-            err instanceof Error && err.name === 'LockAcquireTimeoutError'
-              ? 'lock_timeout'
-              : 'facilitator_error',
+          errorReason,
           errorMessage: err instanceof Error ? err.message : String(err),
           transaction: '',
           network: req.body?.paymentRequirements?.network,
@@ -617,7 +723,7 @@ export function createApp(
       if (!body) return reply;
 
       const check = await rateLimiter.checkCatalog(req);
-      if (!check.allowed) return handleRateLimit(reply, check);
+      if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/resources', check);
 
       const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
       if (validation.hardDrop) {
@@ -626,7 +732,18 @@ export function createApp(
 
       await rateLimiter.recordCatalog(req);
       try {
+        const existing = await catalog.getResource?.(
+          validation.resource.url,
+          validation.resource.toolName ?? null,
+        );
         const entry = await catalog.upsertResource(validation.resource, 'manual');
+        audit('catalog_write', {
+          actor: req.keyId ?? `ip:${req.ip}`,
+          source: 'manual',
+          url: validation.resource.url,
+          tool_name: validation.resource.toolName ?? null,
+          overwritten: Boolean(existing),
+        });
         return reply.send({ ok: true, resource: entry, softDrops: validation.softDrops });
       } catch (err) {
         return reply.code(400).send({ error: 'catalog_error', reason: err.message });

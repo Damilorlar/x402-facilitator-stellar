@@ -12,6 +12,7 @@ import { buildFacilitator } from './facilitator.js';
 import { installHorizonClient } from './horizon-client.js';
 import { installRpcRetry } from './rpc-retry.js';
 import { RateLimiter } from './rate-limit.js';
+import { createRateLimitStore, MemoryStore } from './rate-limit-store.js';
 import { RedisRateLimiter } from './redis-rate-limit.js';
 import { createDistributedLock } from './distributed-lock.js';
 import { buildIdempotencyStore } from './idempotency.js';
@@ -28,19 +29,41 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // Must run BEFORE installRpcRetry: the retry wrapper composes on top of
-// whatever fetch is global when it installs. Innermost first — pooling and
-// circuit-breaking sit under connection-level retries (#120).
+// whatever fetch is global when it installs. Innermost first — pooled sockets
+// and the per-origin breaker (#120) sit under connection-level retries and the
+// RPC breaker (#105). The two breakers are complementary layers, not
+// duplicates: #105 counts connection-level failures per RPC host; #120 also
+// bounds sockets and trips on slow responses for every backend origin.
 const horizon = installHorizonClient({ log: msg => console.log(`  ${msg}`) });
 
 // Retries connection-level failures only; see rpc-retry.js for what that
-// deliberately excludes.
-installRpcRetry({ log: msg => console.warn(`  ${msg}`) });
+// deliberately excludes. The returned handle exposes circuit-breaker state
+// for the readiness probe (#100).
+const rpc = installRpcRetry({
+  log: msg => console.warn(`  ${msg}`),
+  onStateChange: msg => console.warn(`  [Breaker] ${msg}`),
+});
 
 const config = resolveConfig();
+
+// Issue #94: limiter state lives behind a store interface. RATE_LIMIT_STORE is
+// unset by default -> in-memory Map, exactly the pre-#94 behaviour. Set it to
+// 'postgres' (with DATABASE_URL) to share counters across replicas and keep the
+// daily fee ceiling alive across restarts. A misconfiguration refuses to start:
+// silently falling back to per-process memory would double every limit at two
+// replicas and reset the fee ceiling at every deploy — the bug this fixes.
+const rateLimitStore = createRateLimitStore();
+rateLimitStore.ready?.catch(err => {
+  console.error(`[RateLimit] shared store failed to initialise: ${err.message}`);
+});
+
 const { facilitator, signers } = buildFacilitator(config);
+// Store selection, in order of preference. REDIS_URL (upstream) wins when
+// present; RATE_LIMIT_STORE=postgres (#94) is the Postgres-backed shared
+// store; unset means the per-process memory default.
 const rateLimiter = config.redisUrl
   ? new RedisRateLimiter(config.rateLimits, { redisUrl: config.redisUrl })
-  : new RateLimiter(config.rateLimits);
+  : new RateLimiter(config.rateLimits, rateLimitStore);
 const catalog = new MemoryCatalogStore(config);
 const idempotency = buildIdempotencyStore(config);
 
@@ -59,15 +82,11 @@ const webhooks = await createWebhookDispatcher({
   url: config.webhookUrl,
 });
 
-const app = createApp(
-  config,
-  facilitator,
-  rateLimiter,
-  catalog,
-  idempotency,
+const app = createApp(config, facilitator, rateLimiter, catalog, idempotency, {
+  breakerStates: rpc?.getBreakerStates,
   distributedLock,
   webhooks,
-);
+});
 
 app.listen({ port: config.port, host: '0.0.0.0' }, () => {
   console.log(`x402 Stellar facilitator listening on :${config.port}`);
@@ -92,7 +111,11 @@ app.listen({ port: config.port, host: '0.0.0.0' }, () => {
   // Never log the URLs themselves: they may embed credentials.
   console.log(
     `  state    : ${[
-      config.redisUrl ? 'redis rate limits' : 'in-memory rate limits',
+      config.redisUrl
+        ? 'redis rate limits'
+        : rateLimitStore instanceof MemoryStore
+          ? 'in-memory rate limits'
+          : `postgres rate limits (${rateLimitStore.constructor.name})`,
       config.databaseUrl ? 'postgres idempotency' : 'in-memory idempotency',
       distributedLock ? `redlock (${config.redisNodes.length} node(s))` : 'in-process locking',
       webhooks.kind === 'kafka'

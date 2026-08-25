@@ -14,6 +14,11 @@ services:
       # Async webhook delivery (#117).
       - KAFKA_BROKERS=kafka:9092
       - PORT=3402
+      # Unset by default = per-process memory. Set RATE_LIMIT_STORE=postgres in
+      # the environment (or .env) to share limiter state across replicas and
+      # keep the daily fee ceiling alive across restarts.
+      - RATE_LIMIT_STORE=${RATE_LIMIT_STORE:-memory}
+      - AUDIT_LOG_FILE=${AUDIT_LOG_FILE:-}
     depends_on:
       db:
         condition: service_healthy
