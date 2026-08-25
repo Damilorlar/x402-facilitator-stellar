@@ -57,6 +57,7 @@ You can run your own instance of the X402 Facilitator. By doing so, you retain c
 
 We adhere to the following retention periods:
 - **Request Logs**: 7 days.
+- **Audit Records** (`channel: "audit"`, see docs/AUDIT.md): settlements follow the settlement-record class below; all other audit records follow the request-log class. They are separable from diagnostic logs precisely so these classes can be enforced independently.
 - **Search Queries**: 30 days.
 - **Settlement Records**: 90 days (retained longer for dispute resolution and refund processing).
 

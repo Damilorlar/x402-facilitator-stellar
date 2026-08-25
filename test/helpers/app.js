@@ -102,6 +102,7 @@ export async function serve({
   idempotency,
   corsAllowedOrigins,
   nodeEnv,
+  extras,
 } = {}) {
   const app = createApp(
     config ?? testConfig({ corsAllowedOrigins, nodeEnv }),
@@ -109,6 +110,7 @@ export async function serve({
     rateLimiter ?? stubRateLimiter(),
     catalog ?? stubCatalog(),
     idempotency,
+    extras,
   );
 
   const server = app.listen(0);

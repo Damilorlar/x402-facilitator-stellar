@@ -17,6 +17,11 @@ RUN npm ci --omit=dev
 
 COPY --from=builder /app/src ./src
 
+# HEALTHCHECK is a LIVENESS probe, so it targets /healthz, not /health/ready.
+# /health/ready can fail on a downstream Soroban RPC outage; failing the
+# Docker-level check on that would restart-loop the container and make the
+# outage worse (a restart cannot fix someone else's RPC). Orchestrator traffic
+# gating belongs on GET /health/ready, which names the failing dependency.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT:-3402}/healthz || exit 1
 

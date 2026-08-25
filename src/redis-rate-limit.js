@@ -78,11 +78,13 @@ export class RedisRateLimiter extends RateLimiter {
         if (count === 1) await redis.expire(bucketId, windowSec + 1);
         return { count, resetAt };
       },
-      () => {
-        super._increment(ownerId, type, windowSec, amount);
-        const bucket = this.store.get(bucketId.replace('ratelimit:', ''));
-        return { count: bucket?.count ?? amount, resetAt };
-      },
+      () =>
+        // The parent's buckets live behind the store interface (#94): async
+        // increment returns the resulting bucket.
+        super._increment(ownerId, type, windowSec, amount).then(bucket => ({
+          count: bucket?.count ?? amount,
+          resetAt,
+        })),
     );
   }
 
@@ -96,10 +98,8 @@ export class RedisRateLimiter extends RateLimiter {
         if (count + amount > limit) return { allowed: false, limit, remaining: 0, resetAt };
         return { allowed: true, limit, remaining: limit - count - amount, resetAt };
       },
-      () => {
-        const res = this._check(ownerId, type, windowSec, limit, amount);
-        return { ...res, resetAt };
-      },
+      // The parent's _check is async since #94 and already computes resetAt.
+      () => this._check(ownerId, type, windowSec, limit, amount),
     );
   }
 
@@ -161,24 +161,29 @@ export class RedisRateLimiter extends RateLimiter {
   }
 
   async getUsage(keyId) {
-    const ownerId = keyId;
-    const types = [
-      ['verify_rpm', 'verify', 60],
-      ['settle_rpm', 'settle', 60],
-      ['settle_rph', 'settle', 3600],
-      ['settle_rpd', 'settle', 86400],
-      ['fee_spd', 'fee', 86400],
-    ];
-    const counts = {};
-    for (const [name, type, windowSec] of types) {
-      counts[name] = await this._withRedis(
-        async redis =>
-          Number(
-            (await redis.get(`ratelimit:${this._getBucketId(ownerId, type, windowSec)}`)) ?? 0,
-          ),
-        () => this.store.get(this._getBucketId(ownerId, type, windowSec))?.count || 0,
-      );
+    // Degraded / no Redis: the parent's implementation already reads the
+    // in-memory store through the store interface (#94).
+    const readMemory = () => super.getUsage(keyId);
+    if (!this.redis || this.degraded || this.redis.status === 'end') return readMemory();
+    try {
+      const ownerId = keyId;
+      const types = [
+        ['verify_rpm', 'verify', 60],
+        ['settle_rpm', 'settle', 60],
+        ['settle_rph', 'settle', 3600],
+        ['settle_rpd', 'settle', 86400],
+        ['fee_spd', 'fee', 86400],
+      ];
+      const counts = {};
+      for (const [name, type, windowSec] of types) {
+        counts[name] = Number(
+          (await this.redis.get(`ratelimit:${this._getBucketId(ownerId, type, windowSec)}`)) ?? 0,
+        );
+      }
+      return counts;
+    } catch (err) {
+      this._degrade(`Redis operation failed: ${err.message}`);
+      return readMemory();
     }
-    return counts;
   }
 }

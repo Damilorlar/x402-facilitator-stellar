@@ -1,5 +1,49 @@
 # Audit-Readiness Package
 
+## Audit Trail (#109)
+
+Sensitive operations are recorded by `src/audit.js` as one JSON object per
+line, each carrying `"channel": "audit"` so records are separable from
+diagnostic logs (filterable at shipment; optionally mirrored to `AUDIT_LOG_FILE`
+for independent retention). Every record carries a timestamp (`ts`), the
+authenticated caller (`actor`: `keyId`, or `ip:<addr>` in open mode), the
+action (`event`) and the outcome.
+
+### What is audited, and why
+
+| Event | Included because |
+|---|---|
+| `settlement` | Money moved (or was attempted). Carries the **transaction hash**, network, fee and outcome, so a disputed settlement can be reconstructed against the chain. This is the record the audit trail exists for. |
+| `verification` | The gate before settlement. Outcomes and rejection reasons are needed to reconstruct why a payment never proceeded. |
+| `catalog_write` | A public listing is created or overwritten. Without it, a spoofed or hijacked listing cannot be investigated after the fact. Records url, tool name, source (payment/manual) and whether an existing entry was overwritten. |
+| `auth_failure` | Authentication probing/brute force. Records the reason code and source IP — never the presented key material. |
+| `rate_limit_rejected` | Abuse signal and evidence trail for callers hitting ceilings, including `fee_ceiling_exceeded` and store-unavailable refusals. |
+| `rpc_unreachable` | An open circuit breaker caused a caller-visible failure. Distinguishes "our dependency died" from "your payment was rejected" in the trail. |
+
+### What is deliberately not audited
+
+- **Reads** (`/supported`, `/discovery/resources`, `/discovery/search`,
+  `/usage`): no state changes, no money. Logging them would grow the trail
+  without evidentiary value and conflict with data minimisation
+  (docs/PRIVACY.md).
+- **Full request payloads**: never recorded — payloads carry signatures and
+  XDR blobs with no audit value once outcome + transaction hash are on file.
+- **Key material**: `req.keyId` only, never the key itself; the logger
+  additionally redacts secret-shaped fields as defence in depth.
+
+### Relationship to structured application logging (#7)
+
+#7 covers diagnostic logging, correlation IDs and metrics. This audit trail is
+a distinct artifact with different retention and integrity requirements, but
+it is not a second logging mechanism: it is a single structured writer
+emitting self-describing JSON lines that can be routed by the same shipment
+infrastructure #7 introduces. Retention follows docs/PRIVACY.md §7: audit
+records of settlements inherit the 90-day settlement-record class, other audit
+records the 7-day request-log class, pending the automated enforcement tracked
+in #50.
+
+## Proposed Scope
+
 ## Proposed Scope
 The scope of the audit includes the HTTP transport, configuration, authentication, and operational concerns implemented in this repository (`x402-facilitator-stellar`).
 

@@ -74,27 +74,79 @@ keeps open-mode callers out of each other's buckets.
 | `ENABLE_PUBNET` | No | Set to `true` to enable pubnet. |
 | `FACILITATOR_SECRET_PUBNET`| Yes (if pubnet) | `S…` secret for the pubnet signer. |
 | `TRUST_PROXY` | No | Express trust proxy setting: hop count or proxy list (see topology above). Never `true`. |
-| `REDIS_URL` | No | Shared rate-limit buckets across instances, e.g. `redis://redis:6379`. Unset = in-memory. |
-| `DATABASE_URL` | No | Connection string for PostgreSQL (e.g., `postgres://user:pass@host:5432/db`). Enables persistent idempotency keys; unset = in-memory. |
+| `REDIS_URL` | No | Shared rate-limit buckets across instances, e.g. `redis://redis:6379`. Unset = in-memory (or `RATE_LIMIT_STORE`). Takes precedence over `RATE_LIMIT_STORE`. |
+| `DATABASE_URL` | No | Connection string for PostgreSQL (e.g., `postgres://user:pass@host:5432/db`). Enables persistent idempotency keys; required when `RATE_LIMIT_STORE=postgres`; unset otherwise = in-memory. |
+| `RATE_LIMIT_STORE` | No | `memory` (default) or `postgres`. Postgres-backed shared rate-limit state across replicas — see below. Ignored when `REDIS_URL` is set. |
+| `RPC_BREAKER_THRESHOLD` | No | Consecutive connection failures that open the RPC circuit breaker (default `10`). |
+| `RPC_BREAKER_COOLDOWN_MS` | No | How long an open breaker waits before a half-open probe (default `30000`). |
+| `READINESS_TIMEOUT_MS` | No | Per-call timeout for readiness checks, independent of the RPC retry budget (default `3000`). |
+| `READINESS_CACHE_TTL_MS` | No | How long GET /health/ready serves a cached result (default `5000`). |
+| `READINESS_FUNDING_FLOOR_STROOPS` | No | Minimum signer balance reported by the readiness probe (default `0` = must exist). |
+| `AUDIT_LOG_FILE` | No | File that receives audit records in addition to stdout. |
+
+## Shared Rate-Limit State
+
+By default the rate limiter keeps its counters in process memory. That is fine
+for one replica and zero-config testnet, but it has two consequences at scale:
+
+- **A restart resets the daily fee ceiling** (`fee_spd`) — the only spend limit
+  on sponsored fees.
+- **N replicas enforce N separate limits** — every caller gets N× its
+  allowance.
+
+Two shared backends are available; both make replicas enforce one combined
+limit and keep the fee ceiling alive across restarts:
+
+- **Redis** — set `REDIS_URL`. If Redis becomes unreachable, an instance
+  degrades to per-instance in-memory counters and logs a warning; the service
+  stays up.
+- **Postgres** — set `RATE_LIMIT_STORE=postgres` with `DATABASE_URL`. Increments
+  are atomic single-statement upserts (`migrations/002_rate_limit_buckets.sql`,
+  also created automatically on first use) — no lost counts under concurrency.
+  Postgres was chosen as the second backend because it is already part of the
+  stack, and its rows are never evicted: a fee counter is a value that must not
+  be lost to an eviction policy (a Redis instance used for this table must run
+  `maxmemory-policy noeviction`).
+
+**Degrade behaviour differs by backend, deliberately:** Redis-backed limiting
+fails open (the service stays up with per-instance counters); the Postgres
+store fails CLOSED — checks refuse with reason `rate_limit_store_unavailable`
+— because a limiter that cannot see its counters has no idea whether the fee
+ceiling is spent, and answering "allowed" would mean unlimited sponsored spend
+during an outage.
+
+## Health Endpoints and Probes
+
+- `GET /healthz` — liveness. Always `{ ok: true }` while the process runs; no
+  dependency checks. Point container/orchestrator **restart** logic here.
+- `GET /health/ready` — readiness. Checks each configured network's Soroban RPC
+  reachability and the signer account's funded balance; returns `503` naming the
+  failing check per network when any is unhealthy. Results are cached
+  (`READINESS_CACHE_TTL_MS`) and each check runs under its own timeout
+  (`READINESS_TIMEOUT_MS`), independent of the ~12s retry budget in the payment
+  path. Point load-balancer **traffic gating** here.
+
+## Audit Log
+
+Security-relevant events — settlements (with transaction hash), verifications,
+catalog writes, authentication failures, and rate-limit rejections — are
+recorded as structured JSON lines with `"channel": "audit"`, separable from
+diagnostic logs. Set `AUDIT_LOG_FILE` to mirror them to a file with its own
+retention handling. See `docs/AUDIT.md` for the event catalogue and retention.
 
 ## Horizontal Scalability
 
-A single instance keeps all mutable state in process memory. To run multiple
-instances behind a load balancer:
+To run multiple instances behind a load balancer:
 
-- **Rate limits** — set `REDIS_URL`. All instances then share one counter set
-  (per-owner sliding windows with TTLs), so limits mean the same thing
-  regardless of which node handled the request. If Redis becomes unreachable,
-  an instance degrades to per-instance in-memory counters and logs a warning;
-  the service stays up.
+- **Rate limits** — set `REDIS_URL` (or `RATE_LIMIT_STORE=postgres`, above), so
+  limits mean the same thing regardless of which node handled the request.
 - **Idempotency** — set `DATABASE_URL`. Settlement retries are deduplicated via
   a Postgres table with a unique constraint, so a retry routed to a different
-  instance replays the recorded response instead of settling twice. If
-  Postgres is unavailable, idempotency degrades to process-local with a loud
-  warning.
+  instance replays the recorded response instead of settling twice. If Postgres
+  is unavailable, idempotency degrades to process-local with a loud warning.
 - **Catalog** — still per-instance in-memory; see Known Gaps.
 
-The docker-compose file ships both services (`redis`, `db`) and wires both URLs.
+The docker-compose file ships the backing services and wires the URLs.
 
 ## Secret Handling
 
