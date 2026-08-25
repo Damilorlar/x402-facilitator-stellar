@@ -100,6 +100,8 @@ export async function serve({
   rateLimiter,
   catalog,
   idempotency,
+  distributedLock,
+  webhooks,
   corsAllowedOrigins,
   nodeEnv,
 } = {}) {
@@ -109,15 +111,18 @@ export async function serve({
     rateLimiter ?? stubRateLimiter(),
     catalog ?? stubCatalog(),
     idempotency,
+    distributedLock ?? null,
+    webhooks ?? null,
   );
 
-  const server = app.listen(0);
-  await new Promise(resolve => server.once('listening', resolve));
-  const base = `http://127.0.0.1:${server.address().port}`;
+  // Fastify's listen resolves with the bound address once the server is up.
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  const base = `http://127.0.0.1:${app.server.address().port}`;
 
   return {
     base,
-    close: () => new Promise(resolve => server.close(resolve)),
+    app,
+    close: () => app.close(),
     get: (path, headers = {}) => fetch(`${base}${path}`, { headers }),
     post: (path, body, headers = {}) =>
       fetch(`${base}${path}`, {

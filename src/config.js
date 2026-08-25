@@ -184,6 +184,33 @@ export function resolveConfig(env = process.env) {
     databaseUrl: env.DATABASE_URL || null,
 
     /**
+     * Redlock nodes (#116): comma-separated independent Redis masters. Quorum
+     * needs a majority, so three or more is the intended shape. Empty means
+     * in-process locking only (single instance).
+     */
+    redisNodes: (env.REDIS_NODES ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean),
+
+    /**
+     * Kafka (#117). Brokers unset means webhooks are delivered directly,
+     * fire-and-forget, still off the critical path but without durability.
+     */
+    kafka: {
+      brokers: (env.KAFKA_BROKERS ?? '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean),
+      clientId: env.KAFKA_CLIENT_ID ?? 'x402-facilitator-stellar',
+      topic: env.KAFKA_WEBHOOK_TOPIC ?? 'x402-webhook-delivery',
+      groupId: env.KAFKA_WEBHOOK_GROUP_ID ?? 'x402-webhook-dispatchers',
+    },
+
+    /** Default webhook receiver (#117); events may carry their own url. */
+    webhookUrl: env.WEBHOOK_URL || null,
+
+    /**
      * Caller authentication. Unset means open, which is correct for a free
      * testnet instance and wrong for anything else — so the server logs loudly
      * when it is unset (RFP §3.1: the mechanism must be documented and

@@ -15,18 +15,59 @@
  *     ones, so an agent can branch on a code instead of parsing prose;
  *   - responses are passed through from the scheme untouched.
  *
+ * Transport (#119): Fastify rather than Express. The routing/parsing core is
+ * what showed up in load profiling at high RPS; Fastify's schema-compiled
+ * handlers and lower-allocation JSON path address exactly that. Every behaviour
+ * the wire contract had is preserved: status codes, reason codes, response
+ * shapes and headers are byte-for-byte what they were under Express — the
+ * framework changed, the surface did not.
+ *
+ * Body validation is Fastify's built-in AJV compiler with `attachValidation`:
+ * schemas reject structurally impossible bodies before any handler code runs,
+ * but the handler still shapes the rejection, because /verify and /settle
+ * disagree on what a failure body looks like (isValid/invalidReason vs.
+ * success/errorReason/transaction/network) and AJV must not flatten that.
+ *
  * Separated from server.js so the surface can be built and exercised without
  * binding a port, holding a real signer, or spawning a subprocess. server.js is
  * the process entrypoint and does nothing this file does.
  */
 import crypto from 'node:crypto';
-import express from 'express';
+import Fastify from 'fastify';
 import { validateForCatalog } from './catalog/validation.js';
 import { validatePaymentBody } from './request-validation.js';
 import { requestLogger } from './logger.js';
+import { lockKeyFor } from './distributed-lock.js';
+
+/** 256kb body cap, carried over unchanged from the Express transport. */
+const BODY_LIMIT_BYTES = 256 * 1024;
 
 /**
- * Builds the Express app.
+ * AJV schema for both payment routes. Deliberately loose: it asserts only the
+ * structure the transport itself branches on — the same contract as
+ * request-validation.js, expressed declaratively. The transaction XDR,
+ * signatures and amounts inside paymentPayload are the scheme's contract, not
+ * the transport's; a schema strict enough to reject a payload the scheme would
+ * have accepted would be a conformance failure, not hardening.
+ */
+const PAYMENT_BODY_SCHEMA = {
+  type: 'object',
+  required: ['paymentPayload', 'paymentRequirements'],
+  properties: {
+    paymentPayload: { type: 'object' },
+    paymentRequirements: {
+      type: 'object',
+      required: ['scheme', 'network'],
+      properties: {
+        scheme: { type: 'string', minLength: 1 },
+        network: { type: 'string', minLength: 1 },
+      },
+    },
+  },
+};
+
+/**
+ * Builds the Fastify app.
  *
  * Takes its collaborators rather than reaching for module state, which is what
  * makes the surface testable: a test can supply a facilitator that throws, a
@@ -43,37 +84,72 @@ import { requestLogger } from './logger.js';
  * @param {{upsertResource: Function, listResources: Function}} catalog
  * @param {{keyFor: Function, begin: Function, complete: Function}} [idempotency]
  *   optional idempotency store for /settle; absent means in-memory only
- * @returns {import('express').Express}
+ * @param {{withLock: Function}} [distributedLock] - optional Redlock-backed
+ *   distributed lock (#116); absent means no cross-process serialization
+ * @param {{enqueue: Function}} [webhooks] - optional asynchronous webhook
+ *   dispatcher (#117); absent means no webhook notifications are sent
+ * @returns {import('fastify').FastifyInstance}
  */
-export function createApp(config, facilitator, rateLimiter, catalog, idempotency) {
-  const app = express();
-  // Client IP resolution. Unset leaves Express's default (off), correct where
-  // the port is published directly — local development and docker-compose.
-  // Never "true": that trusts the leftmost X-Forwarded-For entry the client
-  // wrote itself. See docs/DEPLOYMENT.md for the topology per environment.
-  if (config.trustProxy !== undefined) {
-    app.set('trust proxy', config.trustProxy);
-  }
-  app.use(express.json({ limit: '256kb' }));
-  // Redacts Authorization/cookie/*_secret before anything hits the log — see
-  // src/logger.js. Never logs the body: paymentPayload/paymentRequirements
-  // are validated, not logged, transport-wide.
-  app.use(requestLogger());
+export function createApp(
+  config,
+  facilitator,
+  rateLimiter,
+  catalog,
+  idempotency,
+  distributedLock = null,
+  webhooks = null,
+) {
+  const app = Fastify({
+    // Client IP resolution. Unset leaves Fastify's default (off), correct where
+    // the port is published directly — local development and docker-compose.
+    // Never "true": that trusts the leftmost X-Forwarded-For entry the client
+    // wrote itself. See docs/DEPLOYMENT.md for the topology per environment.
+    trustProxy: config.trustProxy,
+
+    bodyLimit: BODY_LIMIT_BYTES,
+
+    // The transport logs one structured line per request via requestLogger()
+    // below, redacted through logger.js; Fastify's own pino logging stays off
+    // so there is exactly one choke point for what hits the log.
+    logger: false,
+
+    // AJV options: strict bodies are rejected, never silently coerced or
+    // stripped — removeAdditional off means an unknown field cannot vanish on
+    // its way to the scheme, and coerceTypes off means a numeric network name
+    // is rejected rather than stringified into one.
+    ajv: {
+      customOptions: {
+        removeAdditional: false,
+        coerceTypes: false,
+        allErrors: true,
+      },
+    },
+  });
+
+  /**
+   * Request logging (#78/#86 lineage): one redacted line per request. The
+   * middleware from logger.js speaks the Node req/res pair; Fastify exposes
+   * exactly that as request.raw / reply.raw, so the same redaction choke point
+   * serves both frameworks unchanged.
+   */
+  const logRequest = requestLogger();
+  app.addHook('onRequest', (req, reply, done) => logRequest(req.raw, reply.raw, done));
 
   /**
    * Security headers (#86), hand-set rather than via helmet.
    *
    * helmet's value is its defaults for a document-serving app; this service
    * returns JSON to programmatic clients and serves no HTML, no cookies and no
-   * user-supplied markup, so only three headers do real work here:
+   * user-supplied markup, so only two headers do real work here:
    *
    *   - X-Content-Type-Options: nosniff — stops a JSON response being
    *     reinterpreted as something else by a browser.
    *   - Strict-Transport-Security — meaningful for a hosted mainnet deployment
    *     handling payment authorizations; conditional on NODE_ENV=production so
    *     a local HTTP dev server cannot poison a browser's view of localhost.
-   *   - X-Powered-By — suppressed below; Express advertising itself is free
-   *     reconnaissance.
+   *
+   * Fastify sends no server-advertising header to suppress (Express's
+   * x-powered-by needed an explicit disable; there is nothing equivalent here).
    *
    * Deliberately NOT set:
    *   - Content-Security-Policy — defends against content injection into
@@ -83,14 +159,36 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    *   - X-Frame-Options / frame-ancestors — nothing here is framable; there is
    *     no HTML to clickjack.
    */
-  app.disable('x-powered-by');
-  app.use((_req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
+  app.addHook('onRequest', async (req, reply) => {
+    reply.header('X-Content-Type-Options', 'nosniff');
     if (config.nodeEnv === 'production') {
-      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+      reply.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     }
-    next();
   });
+
+  /**
+   * Hop-count trust proxy (#111 lineage).
+   *
+   * TRUST_PROXY accepts a hop count, a proxy list, or a proxy-addr preset.
+   * Fastify natively understands the string/array forms but has no hop-count
+   * mode, so a number is emulated here the way Express resolves it: walk the
+   * X-Forwarded-For chain from the connection peer inward, trusting exactly N
+   * hops, and report the first untrusted address. Leftmost entries beyond the
+   * trusted depth stay attacker-controlled noise and are never believed.
+   */
+  if (typeof config.trustProxy === 'number') {
+    const hops = Math.max(0, Math.floor(config.trustProxy));
+    app.addHook('onRequest', async req => {
+      const raw = req.headers['x-forwarded-for'] ?? '';
+      const forwarded = String(raw)
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+      const chain = [...forwarded, req.socket.remoteAddress];
+      const ip = chain[Math.max(0, chain.length - 1 - hops)] ?? req.socket.remoteAddress;
+      Object.defineProperty(req, 'ip', { value: ip });
+    });
+  }
 
   // Headers a browser client must be able to read but which are not
   // CORS-safelisted response headers: without naming them in
@@ -120,18 +218,19 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    *
    * Authorization is not a safelisted request header, so every browser call to
    * the payment routes triggers a preflight that must be answered with the
-   * right Allow-Headers or the request silently fails — hence OPTIONS handling
-   * on both classes, mounted before the auth middleware.
+   * right Allow-Headers or the request silently fails — hence explicit OPTIONS
+   * handlers on both classes, registered without auth so a preflight (which
+   * cannot carry an API key) is answered before credentials matter.
    *
-   * Hand-set rather than the cors package: the per-class split means the
-   * package's single global config would be fought, and three headers add no
-   * dependency surface worth paying for.
+   * Hand-set rather than a plugin: the per-class split means a single global
+   * config would be fought, and three headers add no dependency surface worth
+   * paying for.
    */
   function cors(policy) {
-    return (req, res, next) => {
-      res.setHeader('Access-Control-Expose-Headers', EXPOSED_HEADERS);
+    return async (req, reply) => {
+      reply.header('Access-Control-Expose-Headers', EXPOSED_HEADERS);
 
-      const origin = req.get('origin');
+      const origin = req.headers.origin;
       const allowlisted = origin && config.cors.allowedOrigins.includes(origin);
       let granted;
       if (policy === 'public') {
@@ -141,26 +240,27 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         granted = allowlisted ? origin : false;
       }
 
-      res.setHeader('Vary', 'Origin');
+      reply.header('Vary', 'Origin');
 
       if (granted) {
-        res.setHeader('Access-Control-Allow-Origin', granted);
+        reply.header('Access-Control-Allow-Origin', granted);
       }
+    };
+  }
 
-      if (req.method === 'OPTIONS') {
-        // Answer the preflight even when the origin is not granted: the 204
-        // carries no ACAO, so the browser still blocks the actual request —
-        // which is the enforcement point, not the preflight status.
-        res.setHeader(
-          'Access-Control-Allow-Methods',
-          policy === 'public' ? 'GET, OPTIONS' : 'POST, OPTIONS',
-        );
-        res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-        res.setHeader('Access-Control-Max-Age', '600');
-        return res.status(204).end();
-      }
-
-      return next();
+  function preflight(policy) {
+    return async (req, reply) => {
+      cors(policy)(req, reply);
+      // Answer the preflight even when the origin is not granted: the 204
+      // carries no ACAO, so the browser still blocks the actual request —
+      // which is the enforcement point, not the preflight status.
+      reply.header(
+        'Access-Control-Allow-Methods',
+        policy === 'public' ? 'GET, OPTIONS' : 'POST, OPTIONS',
+      );
+      reply.header('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+      reply.header('Access-Control-Max-Age', '600');
+      return reply.code(204).send();
     };
   }
 
@@ -171,7 +271,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * payment response returns immediately. A cataloging failure is logged, never
    * surfaced as a payment failure.
    */
-  async function processCataloging(req, body, res, source = 'payment') {
+  async function processCataloging(req, body, reply, source = 'payment') {
     const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
     const outcome = {};
 
@@ -216,7 +316,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       }
     }
 
-    res.setHeader(
+    reply.header(
       'EXTENSION-RESPONSES',
       Buffer.from(JSON.stringify({ bazaar: outcome })).toString('base64'),
     );
@@ -229,12 +329,13 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * the RFP requires testnet be usable without friction — and it is documented
    * rather than silent: the server logs at boot when it is running open.
    */
-  function requireApiKey(req, res, next) {
-    if (config.apiKeys.length === 0) return next();
+  async function requireApiKey(req, reply) {
+    if (config.apiKeys.length === 0) return;
 
-    const authHeader = req.get('authorization');
+    const authHeader = req.headers.authorization;
     if (!authHeader) {
-      return res.status(401).json({ error: 'unauthorized', reason: 'missing_auth_header' });
+      reply.code(401).send({ error: 'unauthorized', reason: 'missing_auth_header' });
+      return;
     }
 
     let presentedKey = '';
@@ -243,11 +344,13 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     } else if (!authHeader.includes(' ')) {
       presentedKey = authHeader;
     } else {
-      return res.status(401).json({ error: 'unauthorized', reason: 'malformed_auth_header' });
+      reply.code(401).send({ error: 'unauthorized', reason: 'malformed_auth_header' });
+      return;
     }
 
     if (!presentedKey || presentedKey.includes(' ')) {
-      return res.status(401).json({ error: 'unauthorized', reason: 'malformed_auth_header' });
+      reply.code(401).send({ error: 'unauthorized', reason: 'malformed_auth_header' });
+      return;
     }
 
     const presentedHash = crypto.createHash('sha256').update(presentedKey).digest();
@@ -258,33 +361,38 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         crypto.timingSafeEqual(presentedHash, apiKey.hash)
       ) {
         req.keyId = apiKey.id;
-        return next();
+        return;
       }
     }
 
-    return res.status(401).json({ error: 'unauthorized', reason: 'invalid_api_key' });
+    reply.code(401).send({ error: 'unauthorized', reason: 'invalid_api_key' });
   }
 
   /**
    * Require API key for usage (no open mode allowed for this).
    */
-  function requireApiKeyStrict(req, res, next) {
+  async function requireApiKeyStrict(req, reply) {
     if (config.apiKeys.length === 0) {
-      return res.status(401).json({ error: 'unauthorized', reason: 'open_mode_usage_forbidden' });
+      reply.code(401).send({ error: 'unauthorized', reason: 'open_mode_usage_forbidden' });
+      return;
     }
-    requireApiKey(req, res, next);
+    return requireApiKey(req, reply);
   }
 
-  function handleRateLimit(res, checkResult) {
+  function handleRateLimit(reply, checkResult) {
     if (checkResult) {
-      res.set('RateLimit-Limit', checkResult.limit);
-      res.set('RateLimit-Remaining', checkResult.remaining);
-      res.set('RateLimit-Reset', checkResult.resetAt);
+      reply.header('RateLimit-Limit', checkResult.limit);
+      reply.header('RateLimit-Remaining', checkResult.remaining);
+      reply.header('RateLimit-Reset', checkResult.resetAt);
       if (!checkResult.allowed) {
-        res.set('Retry-After', Math.max(1, checkResult.resetAt - Math.floor(Date.now() / 1000)));
-        return res.status(429).json({ error: 'rate_limited', reason: checkResult.reason });
+        reply.header(
+          'Retry-After',
+          Math.max(1, checkResult.resetAt - Math.floor(Date.now() / 1000)),
+        );
+        return reply.code(429).send({ error: 'rate_limited', reason: checkResult.reason });
       }
     }
+    return null;
   }
 
   /**
@@ -292,16 +400,35 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * Returning a non-null reason on a malformed body matters as much as on a
    * failed verification — a null reason anywhere is an acceptance failure.
    *
-   * Validation itself lives in request-validation.js: this only shapes the
-   * rejection into the response the calling route would otherwise have sent,
-   * since /verify and /settle disagree on what a failure body looks like
-   * (isValid/invalidReason vs. success/errorReason/transaction/network).
+   * Two validation layers, one shaping:
+   *   - AJV (via attachValidation) rejects structural impossibilities before
+   *     handler code runs; request.validation carries the errors here.
+   *   - request-validation.js adds what a static schema cannot know — whether
+   *     the named network is one this instance actually serves — with its own
+   *     distinct reason code.
+   * Either way the rejection is shaped into the response the calling route
+   * would otherwise have sent.
    */
-  function readPaymentBody(req, res, route = 'verify') {
-    const result = validatePaymentBody(req.body, config);
+  function readPaymentBody(req, reply, route = 'verify') {
+    let result;
+    if (req.validationError) {
+      const detail = Array.isArray(req.validationError.validation)
+        ? req.validationError.validation[0]
+        : undefined;
+      result = {
+        valid: false,
+        reason: 'invalid_request',
+        message: detail?.message
+          ? `${detail.instancePath ?? detail.params?.missingProperty ?? 'body'} ${detail.message}`.trim()
+          : (req.validationError.message ?? 'invalid request body'),
+      };
+    } else {
+      result = validatePaymentBody(req.body, config);
+    }
+
     if (!result.valid) {
       if (route === 'settle') {
-        res.status(400).json({
+        reply.code(400).send({
           success: false,
           errorReason: result.reason,
           errorMessage: result.message,
@@ -309,7 +436,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           network: req.body?.paymentRequirements?.network,
         });
       } else {
-        res.status(400).json({
+        reply.code(400).send({
           isValid: false,
           invalidReason: result.reason,
           invalidMessage: result.message,
@@ -323,7 +450,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     };
   }
 
-  app.get('/healthz', (_req, res) => res.json({ ok: true }));
+  app.get('/healthz', async () => ({ ok: true }));
 
   /**
    * GET /supported
@@ -332,85 +459,144 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * acceptance item. getSupported() assembles it from the registered schemes, so
    * it is passed through rather than hand-built.
    */
-  app.get('/supported', cors('public'), (_req, res) => {
-    res.json(facilitator.getSupported());
-  });
+  app.get('/supported', { onRequest: cors('public') }, async () => facilitator.getSupported());
 
-  app.get('/usage', requireApiKeyStrict, async (req, res) => {
-    res.json(await rateLimiter.getUsage(req.keyId));
-  });
+  app.get('/usage', { preHandler: requireApiKeyStrict }, async req =>
+    rateLimiter.getUsage(req.keyId),
+  );
 
-  app.post('/verify', cors('authenticated'), requireApiKey, async (req, res) => {
-    const check = await rateLimiter.checkVerify(req);
-    if (!check.allowed) return handleRateLimit(res, check);
+  app.post(
+    '/verify',
+    {
+      onRequest: cors('authenticated'),
+      preHandler: requireApiKey,
+      schema: { body: PAYMENT_BODY_SCHEMA },
+      attachValidation: true,
+    },
+    async (req, reply) => {
+      const check = await rateLimiter.checkVerify(req);
+      if (!check.allowed) return handleRateLimit(reply, check);
 
-    const body = readPaymentBody(req, res);
-    if (!body) return;
-    try {
-      await rateLimiter.recordVerify(req);
-      handleRateLimit(res, check);
-      const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
-      if (result.isValid) {
-        await processCataloging(req, body, res, 'payment');
+      const body = readPaymentBody(req, reply);
+      if (!body) return reply;
+      try {
+        await rateLimiter.recordVerify(req);
+        handleRateLimit(reply, check);
+        const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
+        if (result.isValid) {
+          await processCataloging(req, body, reply, 'payment');
+        }
+        return reply.send(result);
+      } catch (err) {
+        // An exception must not become a 500 with an empty body: to a client that
+        // is indistinguishable from the service being down, and it carries no
+        // reason code. Shape it like a verification failure instead.
+        //
+        // Note ExactStellarScheme already absorbs its own internal exceptions and
+        // returns invalidReason "unexpected_verify_error" rather than throwing, so
+        // this path only catches failures above the scheme — an unregistered
+        // scheme/network pair, for instance. A distinct code keeps the two
+        // distinguishable to a client.
+        return reply.send({
+          isValid: false,
+          invalidReason: 'facilitator_error',
+          invalidMessage: err instanceof Error ? err.message : String(err),
+        });
       }
-      res.json(result);
-    } catch (err) {
-      // An exception must not become a 500 with an empty body: to a client that
-      // is indistinguishable from the service being down, and it carries no
-      // reason code. Shape it like a verification failure instead.
-      //
-      // Note ExactStellarScheme already absorbs its own internal exceptions and
-      // returns invalidReason "unexpected_verify_error" rather than throwing, so
-      // this path only catches failures above the scheme — an unregistered
-      // scheme/network pair, for instance. A distinct code keeps the two
-      // distinguishable to a client.
-      res.status(200).json({
-        isValid: false,
-        invalidReason: 'facilitator_error',
-        invalidMessage: err instanceof Error ? err.message : String(err),
-      });
-    }
-  });
+    },
+  );
 
-  app.post('/settle', cors('authenticated'), requireApiKey, async (req, res) => {
-    const check = await rateLimiter.checkSettle(req);
-    if (!check.allowed) return handleRateLimit(res, check);
+  app.post(
+    '/settle',
+    {
+      onRequest: cors('authenticated'),
+      preHandler: requireApiKey,
+      schema: { body: PAYMENT_BODY_SCHEMA },
+      attachValidation: true,
+    },
+    async (req, reply) => {
+      const check = await rateLimiter.checkSettle(req);
+      if (!check.allowed) return handleRateLimit(reply, check);
 
-    const body = readPaymentBody(req, res, 'settle');
-    if (!body) return;
+      const body = readPaymentBody(req, reply, 'settle');
+      if (!body) return reply;
 
-    // Exact-once settlement: a repeated idempotency key replays the recorded
-    // response instead of touching the chain again. The key is client-supplied
-    // when present and derived from the request body otherwise.
-    const replay = idempotency ? await idempotency.begin(idempotency.keyFor(req)) : null;
-    if (replay?.replayed) {
-      handleRateLimit(res, check);
-      return res.status(replay.statusCode).json(replay.response);
-    }
-
-    try {
-      const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
-      await rateLimiter.recordSettle(req, result.success ? result.transactionFeeStroops || 0 : 0);
-      handleRateLimit(res, check);
-      if (result.success) {
-        await processCataloging(req, body, res, 'payment');
+      /**
+       * Exact-once settlement: a repeated idempotency key replays the recorded
+       * response instead of touching the chain again. The key is client-supplied
+       * when present and derived from the request body otherwise.
+       */
+      const idemReq = {
+        get: name => req.headers[name.toLowerCase()],
+        body: req.body,
+      };
+      const replay = idempotency ? await idempotency.begin(idempotency.keyFor(idemReq)) : null;
+      if (replay?.replayed) {
+        handleRateLimit(reply, check);
+        return reply.code(replay.statusCode).send(replay.response);
       }
-      if (idempotency && replay) {
-        await idempotency.complete(replay.key, 200, result);
+
+      /**
+       * Critical state transition (#116): the settle call moves funds and burns
+       * a sequence number, so identical concurrent requests across pod replicas
+       * must be serialized before the scheme is invoked. The lock key is the
+       * payment itself — two callers racing the same payment contend on the same
+       * key; different payments proceed in parallel.
+       */
+      const lockKey = distributedLock ? lockKeyFor(body.paymentPayload) : null;
+
+      try {
+        const settleOnce = async () => {
+          const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
+          await rateLimiter.recordSettle(
+            req,
+            result.success ? result.transactionFeeStroops || 0 : 0,
+          );
+          handleRateLimit(reply, check);
+          if (result.success) {
+            await processCataloging(req, body, reply, 'payment');
+
+            // Webhook notification (#117): published, not delivered inline.
+            // A slow receiving server must never sit inside this HTTP
+            // request's lifecycle — see src/webhooks/.
+            if (webhooks && typeof webhooks.enqueue === 'function') {
+              webhooks.enqueue({
+                type: 'settlement.completed',
+                transaction: result.transaction,
+                network: result.network,
+                payer: result.payer,
+                payTo: body.paymentRequirements.payTo,
+                amount: body.paymentRequirements.maxAmountRequired,
+                asset: body.paymentRequirements.asset,
+              });
+            }
+          }
+          if (idempotency && replay) {
+            await idempotency.complete(replay.key, 200, result);
+          }
+          return result;
+        };
+
+        const result = distributedLock
+          ? await distributedLock.withLock(lockKey, settleOnce)
+          : await settleOnce();
+        return reply.send(result);
+      } catch (err) {
+        // SettleResponse requires `transaction` and `network` even on failure, so
+        // a client can attribute the failure without correlating out of band.
+        return reply.send({
+          success: false,
+          errorReason:
+            err instanceof Error && err.name === 'LockAcquireTimeoutError'
+              ? 'lock_timeout'
+              : 'facilitator_error',
+          errorMessage: err instanceof Error ? err.message : String(err),
+          transaction: '',
+          network: req.body?.paymentRequirements?.network,
+        });
       }
-      res.json(result);
-    } catch (err) {
-      // SettleResponse requires `transaction` and `network` even on failure, so
-      // a client can attribute the failure without correlating out of band.
-      res.status(200).json({
-        success: false,
-        errorReason: 'facilitator_error',
-        errorMessage: err instanceof Error ? err.message : String(err),
-        transaction: '',
-        network: req.body?.paymentRequirements?.network,
-      });
-    }
-  });
+    },
+  );
 
   /**
    * Manual registration, the secondary path.
@@ -418,28 +604,37 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * Automatic cataloging off the payment path is the primary one — anything
    * that requires a seller to act after being paid gets skipped.
    */
-  app.post('/discovery/resources', cors('authenticated'), requireApiKey, async (req, res) => {
-    const body = readPaymentBody(req, res);
-    if (!body) return;
+  app.post(
+    '/discovery/resources',
+    {
+      onRequest: cors('authenticated'),
+      preHandler: requireApiKey,
+      schema: { body: PAYMENT_BODY_SCHEMA },
+      attachValidation: true,
+    },
+    async (req, reply) => {
+      const body = readPaymentBody(req, reply);
+      if (!body) return reply;
 
-    const check = await rateLimiter.checkCatalog(req);
-    if (!check.allowed) return handleRateLimit(res, check);
+      const check = await rateLimiter.checkCatalog(req);
+      if (!check.allowed) return handleRateLimit(reply, check);
 
-    const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
-    if (validation.hardDrop) {
-      return res.status(400).json({ error: 'invalid_resource', reason: validation.reason });
-    }
+      const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
+      if (validation.hardDrop) {
+        return reply.code(400).send({ error: 'invalid_resource', reason: validation.reason });
+      }
 
-    await rateLimiter.recordCatalog(req);
-    try {
-      const entry = await catalog.upsertResource(validation.resource, 'manual');
-      res.json({ ok: true, resource: entry, softDrops: validation.softDrops });
-    } catch (err) {
-      res.status(400).json({ error: 'catalog_error', reason: err.message });
-    }
-  });
+      await rateLimiter.recordCatalog(req);
+      try {
+        const entry = await catalog.upsertResource(validation.resource, 'manual');
+        return reply.send({ ok: true, resource: entry, softDrops: validation.softDrops });
+      } catch (err) {
+        return reply.code(400).send({ error: 'catalog_error', reason: err.message });
+      }
+    },
+  );
 
-  app.get('/discovery/resources', cors('public'), async (req, res) => {
+  app.get('/discovery/resources', { onRequest: cors('public') }, async (req, reply) => {
     let extensions;
     if (req.query.extensions) {
       extensions = Array.isArray(req.query.extensions)
@@ -465,7 +660,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       let parsedOffset = parseInt(params.offset, 10);
       if (isNaN(parsedOffset)) parsedOffset = 0;
 
-      res.json({
+      return reply.send({
         x402Version: 2,
         items: result.items,
         pagination: {
@@ -475,13 +670,13 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         },
       });
     } catch (err) {
-      res.status(500).json({ error: 'internal_error', message: err.message });
+      return reply.code(500).send({ error: 'internal_error', message: err.message });
     }
   });
 
-  app.get('/discovery/search', cors('public'), async (req, res) => {
+  app.get('/discovery/search', { onRequest: cors('public') }, async (req, reply) => {
     if (!req.query.query) {
-      return res.status(400).json({ error: 'invalid_request', reason: 'query is required' });
+      return reply.code(400).send({ error: 'invalid_request', reason: 'query is required' });
     }
 
     let extensions;
@@ -504,47 +699,51 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
 
     try {
       const result = await catalog.search(params);
-      res.json({
+      return reply.send({
         x402Version: 2,
         resources: result.resources,
         partialResults: result.partialResults,
         pagination: result.pagination,
       });
     } catch (err) {
-      res.status(500).json({ error: 'internal_error', message: err.message });
+      return reply.code(500).send({ error: 'internal_error', message: err.message });
     }
   });
 
   /**
    * Preflight routes (#76).
    *
-   * Express 5 does not answer OPTIONS itself, so each CORS-enabled path gets
-   * one explicitly. The cors() middleware sees the OPTIONS method and replies
-   * 204 — carrying ACAO only when the origin is granted — before auth
-   * middleware ever runs, which matters because a preflight cannot carry the
+   * Each CORS-enabled path gets an explicit OPTIONS handler. It sees the
+   * OPTIONS method and replies 204 — carrying ACAO only when the origin is
+   * granted — and carries no auth hook, because a preflight cannot carry the
    * API key.
    */
-  app.options('/supported', cors('public'));
-  app.options('/discovery/search', cors('public'));
-  app.options('/discovery/resources', cors('authenticated'));
-  app.options('/verify', cors('authenticated'));
-  app.options('/settle', cors('authenticated'));
+  app.options('/supported', { onRequest: cors('public') }, preflight('public'));
+  app.options('/discovery/search', { onRequest: cors('public') }, preflight('public'));
+  app.options(
+    '/discovery/resources',
+    { onRequest: cors('authenticated') },
+    preflight('authenticated'),
+  );
+  app.options('/verify', { onRequest: cors('authenticated') }, preflight('authenticated'));
+  app.options('/settle', { onRequest: cors('authenticated') }, preflight('authenticated'));
 
   /**
    * 404 (#78). Every rejection carries a non-null reason code, transport-level
    * ones included — an unknown route is no exception.
    */
-  app.use((req, res) => {
-    res.status(404).json({ error: 'not_found', reason: 'route_not_found' });
+  app.setNotFoundHandler((_req, reply) => {
+    reply.code(404).send({ error: 'not_found', reason: 'route_not_found' });
   });
 
   /**
-   * The one error boundary (#78), registered last so Express 5 forwards both
-   * thrown errors and rejected promises from async handlers to it. The
-   * route-level catch blocks above are left alone: they encode deliberate
-   * decisions (/verify answers 200 with isValid: false rather than a 500,
-   * because to a client a 500 is indistinguishable from the service being
-   * down); this boundary only catches what escapes them.
+   * The one error boundary (#78), registered last so both thrown errors and
+   * rejected promises from async handlers reach it. The route-level catch
+   * blocks above are left alone: they encode deliberate decisions (/verify
+   * answers 200 with isValid: false rather than a 500, because to a client a
+   * 500 is indistinguishable from the service being down); this boundary only
+   * catches what escapes them — plus the two body-parser failures Fastify
+   * raises before any handler runs (malformed JSON, oversized body).
    *
    * The response shape is matched to the route, not flattened into a generic
    * {error} — /verify failures look like verification failures, /settle
@@ -554,37 +753,41 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * Stack traces go to the server log only, never the wire, and that is not
    * gated on NODE_ENV — which is unset in the Docker image.
    */
-  app.use((err, req, res, _next) => {
-    console.error(`[Error] ${err?.type ?? err?.name ?? 'Error'}: ${err?.message}`);
+  app.setErrorHandler((err, req, reply) => {
+    console.error(`[Error] ${err?.type ?? err?.code ?? err?.name ?? 'Error'}: ${err?.message}`);
 
-    let status = 500;
+    let status = err?.statusCode && Number.isInteger(err.statusCode) ? err.statusCode : 500;
     let code = 'internal_error';
-    if (err?.type === 'entity.parse.failed') {
+
+    // Fastify's content-parser errors, mapped onto the reason codes the
+    // Express transport used to emit for entity.parse.failed / entity.too.large.
+    if (err?.code === 'FST_ERR_CTP_INVALID_JSON') {
       status = 400;
       code = 'malformed_json';
-    } else if (err?.type === 'entity.too.large') {
+    } else if (err?.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
       status = 413;
       code = 'payload_too_large';
     }
-    const message = err instanceof Error ? err.message : String(err);
 
-    if (req.path === '/verify') {
-      return res.status(status).json({
+    const path = req.routeOptions?.url ?? req.raw.url?.split('?')[0];
+
+    if (path === '/verify') {
+      return reply.code(status).send({
         isValid: false,
         invalidReason: code,
-        invalidMessage: message,
+        invalidMessage: err instanceof Error ? err.message : String(err),
       });
     }
-    if (req.path === '/settle') {
-      return res.status(status).json({
+    if (path === '/settle') {
+      return reply.code(status).send({
         success: false,
         errorReason: code,
-        errorMessage: message,
+        errorMessage: err instanceof Error ? err.message : String(err),
         transaction: '',
         network: req.body?.paymentRequirements?.network,
       });
     }
-    return res.status(status).json({ error: code, reason: code });
+    return reply.code(status).send({ error: code, reason: code });
   });
 
   return app;
