@@ -52,9 +52,23 @@ export function redact(value) {
 }
 
 /**
- * Express middleware: logs one line per request with redacted headers, after
- * the response finishes. Never touches req.body — see the module comment.
+ * Request logging middleware: logs one line per request with redacted headers,
+ * after the response finishes. Never touches req.body — see the module comment.
+ *
+ * Speaks the Node http.IncomingMessage/ServerResponse pair rather than any
+ * framework's decorated request, so the same function serves whatever transport
+ * wraps it (Express called it directly; the Fastify transport passes
+ * request.raw / reply.raw).
  */
+function pathOf(req) {
+  // Node's raw request carries the URL with querystring; Express decorates
+  // `path`. Prefer stripping the query off the raw URL, fall back to `path`.
+  if (typeof req.url === 'string') {
+    return req.url.split('?')[0];
+  }
+  return typeof req.path === 'string' ? req.path : '';
+}
+
 export function requestLogger(log = msg => console.log(msg)) {
   return (req, res, next) => {
     const startedAt = Date.now();
@@ -63,13 +77,13 @@ export function requestLogger(log = msg => console.log(msg)) {
       log(
         JSON.stringify({
           method: req.method,
-          path: req.path,
+          path: pathOf(req),
           status: res.statusCode,
           durationMs,
           headers: redact(req.headers),
         }),
       );
     });
-    next();
+    next?.();
   };
 }
