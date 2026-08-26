@@ -498,6 +498,36 @@ describe('automatic cataloging', () => {
     }
   });
 
+
+  test('POST /discovery/resources returns JSON, not HTML, when the limiter errors', async () => {
+    const rateLimiter = stubRateLimiter();
+    rateLimiter.checkCatalog = () => { throw new Error('limiter is on fire'); };
+    const app = await serve({ rateLimiter });
+    try {
+      const res = await app.post('/discovery/resources', VALID_BODY);
+      assert.equal(res.status, 500);
+      const contentType = res.headers.get('content-type');
+      assert.equal(contentType.includes('application/json'), true);
+      const json = await res.json();
+      assert.equal(json.error, 'internal_error');
+    } finally {
+      await app.close();
+    }
+  });
+
+  test('a synchronous catalog error (e.g. rate limiter crash) does not fail the payment', async () => {
+    const rateLimiter = stubRateLimiter({ allow: true });
+    rateLimiter.checkCatalog = () => { throw new Error('limiter is on fire'); };
+    const app = await serve({ rateLimiter });
+    try {
+      const res = await app.post('/settle', VALID_BODY);
+      assert.equal(res.status, 200);
+      assert.equal((await res.json()).success, true);
+    } finally {
+      await app.close();
+    }
+  });
+
   test('a slow catalog does not hold up the payment response', async () => {
     const catalog = stubCatalog({
       upsertResource: () => new Promise(resolve => setTimeout(resolve, 2000)),

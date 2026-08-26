@@ -308,6 +308,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * is logged, never surfaced as a payment failure.
    */
   async function processCataloging(req, body, reply, source = 'payment') {
+    try {
     const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
     const outcome = {};
 
@@ -378,6 +379,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       'EXTENSION-RESPONSES',
       Buffer.from(JSON.stringify({ bazaar: outcome })).toString('base64'),
     );
+    } catch (err) {
+      console.error('[Catalog] Unhandled error during processCataloging:', err);
+    }
   }
 
   /**

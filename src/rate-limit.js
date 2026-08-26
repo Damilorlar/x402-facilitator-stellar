@@ -159,6 +159,7 @@ export class RateLimiter {
    * behind the shared store (#94).
    */
   async checkCatalog(req) {
+    // Both check and record key on req.keyId || req.ip to share a single catalog budget for unauthenticated callers per IP, or per authenticated caller regardless of IP.
     const ownerId = req.keyId || req.ip;
     const limits = this._getKeyConfig(req.keyId);
     const res = await this._check(ownerId, 'catalog', 60, limits.catalogRpm);
