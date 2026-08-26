@@ -8,4 +8,5 @@ Welcome to the X402 Facilitator documentation. Please choose the path that best 
 
 **Reference:**
 - [Architecture](./ARCHITECTURE.md): System design, components, and the discovery path
+- [Business Model](./BUSINESS-MODEL.md): who pays for what, metering, and why the rate limits sit where they do
 - [Glossary](./GLOSSARY.md): Terminology (Stellar, X402, and Facilitator concepts)

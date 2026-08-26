@@ -40,7 +40,9 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "licenses": "node scripts/check-licenses.mjs",
-    "eval": "node eval/runner.js"
+    "eval": "node eval/runner.js",
+    "fund:testnet": "node scripts/fund-testnet-accounts.mjs",
+    "prepare:testnet-usdc": "node scripts/prepare-testnet-usdc.mjs"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.2.0",
