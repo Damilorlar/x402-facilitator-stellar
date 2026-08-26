@@ -35,6 +35,8 @@
  */
 import crypto from 'node:crypto';
 import Fastify from 'fastify';
+import { trace, context, propagation, SpanStatusCode } from '@opentelemetry/api';
+import { tracer } from './tracing.js';
 import { validateForCatalog } from './catalog/validation.js';
 import { createAuditLogger } from './audit.js';
 import { createReadinessChecker } from './readiness.js';
@@ -68,6 +70,103 @@ const PAYMENT_BODY_SCHEMA = {
     },
   },
 };
+
+/**
+ * Attaches metadata to the currently active span (the http server span created
+ * by the OTel http instrumentation), if one is active. Never throws when
+ * tracing is disabled — getActiveSpan() simply returns undefined then.
+ *
+ * @param {Record<string, string | number | boolean>} attrs
+ */
+function annotateSpan(attrs) {
+  const span = trace.getActiveSpan();
+  if (!span) return;
+  for (const [key, value] of Object.entries(attrs)) {
+    span.setAttribute(key, value);
+  }
+}
+
+/**
+ * Wraps a request handler in an inbound span that continues the upstream W3C
+ * trace (extracted from the request headers) and carries route/tenant
+ * metadata. Outbound calls made inside — the wrapped `fetch` to Horizon/Soroban
+ * RPC, the background webhook delivery — inherit this span as their parent,
+ * so the whole request is one correlated trace across service boundaries.
+ *
+ * Auto http instrumentation cannot reliably patch Fastify v5's ESM module, so
+ * the inbound span is created here explicitly. `startActiveSpan` makes it the
+ * active context for the duration of `fn`, which is what lets the undici
+ * instrumentation parent outbound calls to it.
+ *
+ * @param {string} name - span name, e.g. 'HTTP POST /settle'
+ * @param {object} req - Fastify request
+ * @param {(span: import('@opentelemetry/api').Span) => Promise<any>} fn
+ */
+async function withRequestSpan(name, req, fn) {
+  const parentCtx = propagation.extract(context.active(), req.headers);
+  return tracer.startActiveSpan(
+    name,
+    {
+      attributes: {
+        'http.method': req.method,
+        'http.route': req.routeOptions?.url ?? req.url?.split('?')[0],
+        'tenant.id': req.keyId ?? 'open',
+      },
+    },
+    parentCtx,
+    async span => {
+      try {
+        return await fn(span);
+      } catch (err) {
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      } finally {
+        span.end();
+      }
+    },
+  );
+}
+
+/**
+ * Wraps an ExactStellarScheme call in a child span so chain latency is
+ * attributable separately from transport latency. Carries the network and, on
+ * success, the settlement transaction hash (the cross-system correlation key a
+ * downstream receiver uses to reconcile the payment).
+ *
+ * @param {string} op - 'verify' | 'settle'
+ * @param {string} network
+ * @param {() => Promise<any>} fn
+ * @param {Record<string, string | number | boolean>} [extraAttrs]
+ */
+async function tracedSchemeCall(op, network, fn, extraAttrs = {}) {
+  return tracer.startActiveSpan(`facilitator.${op}`, async span => {
+    span.setAttribute('x402.network', network);
+    // Carry request-level metadata (e.g. tenant.id) onto the scheme span so the
+    // correlation survives even when no inbound server span is the active one.
+    for (const [key, value] of Object.entries(extraAttrs)) {
+      span.setAttribute(key, value);
+    }
+    try {
+      const result = await fn();
+      if (result && result.transaction) {
+        span.setAttribute('x402.transaction.id', result.transaction);
+      }
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
 
 /**
  * Builds the Fastify app.
@@ -534,9 +633,10 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    */
   app.get('/supported', { onRequest: cors('public') }, async () => facilitator.getSupported());
 
-  app.get('/usage', { preHandler: requireApiKeyStrict }, async req =>
-    rateLimiter.getUsage(req.keyId),
-  );
+  app.get('/usage', { preHandler: requireApiKeyStrict }, async req => {
+    annotateSpan({ 'tenant.id': req.keyId ?? 'open', 'http.route': '/usage' });
+    return rateLimiter.getUsage(req.keyId);
+  });
 
   app.post(
     '/verify',
@@ -547,49 +647,56 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       attachValidation: true,
     },
     async (req, reply) => {
-      const check = await rateLimiter.checkVerify(req);
-      if (!check.allowed) return rejectRateLimited(req, reply, '/verify', check);
+      return withRequestSpan(`HTTP ${req.method} /verify`, req, async () => {
+        const check = await rateLimiter.checkVerify(req);
+        if (!check.allowed) return rejectRateLimited(req, reply, '/verify', check);
 
-      const body = readPaymentBody(req, reply);
-      if (!body) return reply;
-      try {
-        await rateLimiter.recordVerify(req);
-        handleRateLimit(reply, check);
-        const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
-        audit('verification', {
-          actor: req.keyId ?? `ip:${req.ip}`,
-          outcome: result.isValid ? 'valid' : 'invalid',
-          invalid_reason: result.invalidReason ?? null,
-          network: body.paymentRequirements.network,
-        });
-        if (result.isValid) {
-          await processCataloging(req, body, reply, 'payment');
+        const body = readPaymentBody(req, reply);
+        if (!body) return reply;
+        try {
+          await rateLimiter.recordVerify(req);
+          handleRateLimit(reply, check);
+          const result = await tracedSchemeCall(
+            'verify',
+            body.paymentRequirements.network,
+            () => facilitator.verify(body.paymentPayload, body.paymentRequirements),
+            { 'tenant.id': req.keyId ?? 'open' },
+          );
+          audit('verification', {
+            actor: req.keyId ?? `ip:${req.ip}`,
+            outcome: result.isValid ? 'valid' : 'invalid',
+            invalid_reason: result.invalidReason ?? null,
+            network: body.paymentRequirements.network,
+          });
+          if (result.isValid) {
+            await processCataloging(req, body, reply, 'payment');
+          }
+          return reply.send(result);
+        } catch (err) {
+          // An exception must not become a 500 with an empty body: to a client that
+          // is indistinguishable from the service being down, and it carries no
+          // reason code. Shape it like a verification failure instead.
+          //
+          // Note ExactStellarScheme already absorbs its own internal exceptions and
+          // returns invalidReason "unexpected_verify_error" rather than throwing, so
+          // this path only catches failures above the scheme — an unregistered
+          // scheme/network pair, for instance. A distinct code keeps the two
+          // distinguishable to a client.
+          //
+          // An open RPC breaker gets its own code so a caller can tell "the chain
+          // is unreachable" from "your payment was rejected" (#105, #6).
+          const invalidReason =
+            err?.code === 'RPC_BREAKER_OPEN' ? 'soroban_rpc_unreachable' : 'facilitator_error';
+          if (invalidReason !== 'facilitator_error') {
+            audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'verify' });
+          }
+          return reply.send({
+            isValid: false,
+            invalidReason,
+            invalidMessage: err instanceof Error ? err.message : String(err),
+          });
         }
-        return reply.send(result);
-      } catch (err) {
-        // An exception must not become a 500 with an empty body: to a client that
-        // is indistinguishable from the service being down, and it carries no
-        // reason code. Shape it like a verification failure instead.
-        //
-        // Note ExactStellarScheme already absorbs its own internal exceptions and
-        // returns invalidReason "unexpected_verify_error" rather than throwing, so
-        // this path only catches failures above the scheme — an unregistered
-        // scheme/network pair, for instance. A distinct code keeps the two
-        // distinguishable to a client.
-        //
-        // An open RPC breaker gets its own code so a caller can tell "the chain
-        // is unreachable" from "your payment was rejected" (#105, #6).
-        const invalidReason =
-          err?.code === 'RPC_BREAKER_OPEN' ? 'soroban_rpc_unreachable' : 'facilitator_error';
-        if (invalidReason !== 'facilitator_error') {
-          audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'verify' });
-        }
-        return reply.send({
-          isValid: false,
-          invalidReason,
-          invalidMessage: err instanceof Error ? err.message : String(err),
-        });
-      }
+      });
     },
   );
 
@@ -602,13 +709,14 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       attachValidation: true,
     },
     async (req, reply) => {
-      const check = await rateLimiter.checkSettle(req);
-      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
+      return withRequestSpan(`HTTP ${req.method} /settle`, req, async () => {
+        const check = await rateLimiter.checkSettle(req);
+        if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
 
-      const body = readPaymentBody(req, reply, 'settle');
-      if (!body) return reply;
+        const body = readPaymentBody(req, reply, 'settle');
+        if (!body) return reply;
 
-      /**
+        /**
        * Exact-once settlement: a repeated idempotency key replays the recorded
        * response instead of touching the chain again. The key is client-supplied
        * when present and derived from the request body otherwise.
@@ -634,7 +742,12 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
 
       try {
         const settleOnce = async () => {
-          const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
+          const result = await tracedSchemeCall(
+            'settle',
+            body.paymentRequirements.network,
+            () => facilitator.settle(body.paymentPayload, body.paymentRequirements),
+            { 'tenant.id': req.keyId ?? 'open' },
+          );
           await rateLimiter.recordSettle(
             req,
             result.success ? result.transactionFeeStroops || 0 : 0,
@@ -701,6 +814,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           network: req.body?.paymentRequirements?.network,
         });
       }
+    });
     },
   );
 
@@ -721,6 +835,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     async (req, reply) => {
       const body = readPaymentBody(req, reply);
       if (!body) return reply;
+      annotateSpan({ 'tenant.id': req.keyId ?? 'open', 'http.route': '/discovery/resources' });
 
       const check = await rateLimiter.checkCatalog(req);
       if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/resources', check);

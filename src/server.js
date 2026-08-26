@@ -7,6 +7,7 @@
  * this file is only the wiring a test has no use for.
  */
 import dotenv from 'dotenv';
+import { initTracing } from './tracing.js';
 import { resolveConfig } from './config.js';
 import { buildFacilitator } from './facilitator.js';
 import { installHorizonClient } from './horizon-client.js';
@@ -27,6 +28,12 @@ import { createApp } from './app.js';
 if (process.env.NODE_ENV !== 'production') {
   dotenv.config({ quiet: true });
 }
+
+// Must run BEFORE installHorizonClient / installRpcRetry so the undici
+// instrumentation patches the npm `undici` client they dial through, and before
+// the http server starts so the inbound server span + traceparent extraction
+// are live for every request. No-op (returns null) when TRACING_ENABLED=false.
+const otel = initTracing();
 
 // Must run BEFORE installRpcRetry: the retry wrapper composes on top of
 // whatever fetch is global when it installs. Innermost first — pooled sockets
@@ -142,6 +149,7 @@ async function shutdown(signal) {
     await webhooks.stop().catch(() => {});
     await distributedLock?.quit().catch(() => {});
     horizon.restore();
+    await otel?.shutdown().catch(() => {});
   } finally {
     process.exit(0);
   }

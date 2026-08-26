@@ -19,6 +19,7 @@
  */
 
 import crypto from 'node:crypto';
+import { fetch as undiciFetch } from 'undici';
 
 const DEFAULT_TOPIC = 'x402-webhook-delivery';
 const DEFAULT_GROUP_ID = 'x402-webhook-dispatchers';
@@ -40,7 +41,7 @@ const DEFAULT_CLIENT_ID = 'x402-facilitator-stellar';
 export async function deliverWebhook({
   url,
   body,
-  fetchImpl = fetch,
+  fetchImpl = undiciFetch,
   maxAttempts = 5,
   baseBackoffMs = 500,
   warn = msg => console.warn(msg),
@@ -95,7 +96,7 @@ export async function createWebhookDispatcher({
   /** Default receiver; events may override with their own url. */
   url = null,
   createKafka,
-  fetchImpl,
+  fetchImpl = undiciFetch,
   log = () => {},
   warn = msg => console.warn(msg),
 } = {}) {
