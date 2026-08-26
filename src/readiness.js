@@ -58,14 +58,16 @@ export function createReadinessChecker(
   const call = rpcCall ?? ((url, body) => defaultRpcCall(url, body, timeoutMs));
   const targets = config.networks.map(network => {
     const netConfig = config.perNetwork[network];
-    const secrets = netConfig.secrets ?? (netConfig.secret ? [netConfig.secret] : []);
-    const addresses = secrets.map(sec => Keypair.fromSecret(sec).publicKey());
-    const feeBumpAddress = netConfig.feeBumpSecret ? Keypair.fromSecret(netConfig.feeBumpSecret).publicKey() : null;
+    let address = '';
+    try {
+      address = Keypair.fromSecret(netConfig.secret).publicKey();
+    } catch {
+      address = netConfig.secret ?? '';
+    }
     return {
       network,
       rpcUrl: netConfig.rpcUrl ?? (network === TESTNET ? DEFAULT_TESTNET_RPC : undefined),
-      addresses,
-      feeBumpAddress,
+      address,
     };
   });
 
