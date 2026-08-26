@@ -8,4 +8,5 @@ Welcome to the X402 Facilitator documentation. Please choose the path that best 
 
 **Reference:**
 - [Architecture](./ARCHITECTURE.md): System design, components, and the discovery path
+- [Event Sourcing](./EVENT-SOURCING.md): The append-only settlement state machine and its audit trail
 - [Glossary](./GLOSSARY.md): Terminology (Stellar, X402, and Facilitator concepts)
