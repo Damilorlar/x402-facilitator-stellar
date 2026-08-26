@@ -41,6 +41,7 @@ import { createReadinessChecker } from './readiness.js';
 import { validatePaymentBody } from './request-validation.js';
 import { requestLogger } from './logger.js';
 import { lockKeyFor } from './distributed-lock.js';
+import { requestState } from './request-state.js';
 
 /** 256kb body cap, carried over unchanged from the Express transport. */
 const BODY_LIMIT_BYTES = 256 * 1024;
@@ -131,7 +132,21 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * serves both frameworks unchanged.
    */
   const logRequest = requestLogger();
-  app.addHook('onRequest', (req, reply, done) => logRequest(req.raw, reply.raw, done));
+  let activeRequestCount = 0;
+  app.decorate('getInFlightCount', () => activeRequestCount);
+
+  app.addHook('onRequest', (req, reply, done) => {
+    activeRequestCount++;
+    logRequest(req.raw, reply.raw, () => {});
+    requestState.run({ submitted: false }, () => {
+      done();
+    });
+  });
+
+  app.addHook('onResponse', (_req, _reply, done) => {
+    activeRequestCount = Math.max(0, activeRequestCount - 1);
+    done();
+  });
 
   const audit = extras.audit ?? createAuditLogger();
 
@@ -147,6 +162,8 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           catalog,
         })
       : null);
+
+  app.decorate('readiness', readiness);
 
   /**
    * Security headers (#86), hand-set rather than via helmet.
@@ -370,11 +387,16 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     // The presented key material itself is deliberately never recorded.
     const reject = reason => {
       audit('auth_failure', { actor: `ip:${req.ip}`, reason });
-      reply.code(401).send({ isValid: false, invalidReason: reason, invalidMessage: 'unauthorized' });
+      reply
+        .code(401)
+        .send({ isValid: false, invalidReason: reason, invalidMessage: 'unauthorized', reason });
     };
 
     const authHeader = req.headers.authorization;
     if (!authHeader) return reject('missing_auth_header');
+    if (authHeader === 'Bearer' || authHeader === 'Bearer ') {
+      return reject('malformed_auth_header');
+    }
 
     let presentedKey = '';
     if (authHeader.startsWith('Bearer ')) {
@@ -411,7 +433,11 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    */
   async function requireApiKeyStrict(req, reply) {
     if (config.apiKeys.length === 0) {
-      reply.code(401).send({ isValid: false, invalidReason: 'open_mode_usage_forbidden', invalidMessage: 'unauthorized' });
+      reply.code(401).send({
+        isValid: false,
+        invalidReason: 'open_mode_usage_forbidden',
+        invalidMessage: 'unauthorized',
+      });
       return;
     }
     return requireApiKey(req, reply);
@@ -438,7 +464,12 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           'Retry-After',
           Math.max(1, checkResult.resetAt - Math.floor(Date.now() / 1000)),
         );
-        return reply.code(429).send({ isValid: false, invalidReason: 'rate_limited', invalidMessage: checkResult.reason });
+        return reply.code(429).send({
+          isValid: false,
+          invalidReason: 'rate_limited',
+          invalidMessage: checkResult.reason,
+          reason: checkResult.reason,
+        });
       }
     }
     return null;
@@ -502,14 +533,14 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   app.get('/healthz', async () => ({ ok: true }));
 
   /**
-   * GET /health/ready — the readiness probe (#100).
+   * GET /readyz — the readiness probe (#100, #8).
    *
    * Unlike /healthz this CAN fail: 503 names which check failed for which
    * network. Result is cached and bounded by its own timeout — see
    * src/readiness.js. Catalogue trouble is reported but never fails readiness:
    * a cataloguing failure must never fail a payment.
    */
-  app.get('/health/ready', async (_req, reply) => {
+  app.get('/readyz', async (_req, reply) => {
     if (!readiness) {
       return reply.code(503).send({
         ok: false,
@@ -555,7 +586,22 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       try {
         await rateLimiter.recordVerify(req);
         handleRateLimit(reply, check);
-        const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
+
+        const timeoutMs = config.requestTimeoutMs ?? 30_000;
+        let timeoutTimer;
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            const err = new Error('request timeout');
+            err.code = 'REQUEST_TIMEOUT';
+            reject(err);
+          }, timeoutMs);
+        });
+
+        const verifyPromise = facilitator.verify(body.paymentPayload, body.paymentRequirements);
+        const result = await Promise.race([verifyPromise, timeoutPromise]).finally(() => {
+          clearTimeout(timeoutTimer);
+        });
+
         audit('verification', {
           actor: req.keyId ?? `ip:${req.ip}`,
           outcome: result.isValid ? 'valid' : 'invalid',
@@ -579,10 +625,18 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         //
         // An open RPC breaker gets its own code so a caller can tell "the chain
         // is unreachable" from "your payment was rejected" (#105, #6).
-        const invalidReason =
-          err?.code === 'RPC_BREAKER_OPEN' ? 'soroban_rpc_unreachable' : 'facilitator_error';
+        let invalidReason = 'facilitator_error';
+        if (err?.code === 'REQUEST_TIMEOUT') {
+          invalidReason = 'request_timeout';
+        } else if (err?.code === 'RPC_BREAKER_OPEN') {
+          invalidReason = 'soroban_rpc_unreachable';
+        }
         if (invalidReason !== 'facilitator_error') {
-          audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'verify' });
+          audit('rpc_unreachable', {
+            actor: req.keyId ?? `ip:${req.ip}`,
+            op: 'verify',
+            reason: invalidReason,
+          });
         }
         return reply.send({
           isValid: false,
@@ -675,9 +729,28 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           return result;
         };
 
-        const result = distributedLock
-          ? await distributedLock.withLock(lockKey, settleOnce)
-          : await settleOnce();
+        const timeoutMs = config.requestTimeoutMs ?? 30_000;
+        let timeoutTimer;
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            const isSubmitted = requestState.getStore()?.submitted === true;
+            const err = new Error(
+              isSubmitted
+                ? 'settlement submitted to network but timed out waiting for confirmation'
+                : 'request timeout',
+            );
+            err.code = isSubmitted ? 'SUBMITTED_OUTCOME_UNKNOWN' : 'REQUEST_TIMEOUT';
+            reject(err);
+          }, timeoutMs);
+        });
+
+        const resultPromise = distributedLock
+          ? distributedLock.withLock(lockKey, settleOnce)
+          : settleOnce();
+
+        const result = await Promise.race([resultPromise, timeoutPromise]).finally(() => {
+          clearTimeout(timeoutTimer);
+        });
         return reply.send(result);
       } catch (err) {
         // SettleResponse requires `transaction` and `network` even on failure, so
@@ -687,18 +760,31 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         // and an open RPC breaker gets its own code so a caller can tell "the
         // chain is unreachable" from "your payment was rejected" (#105, #6).
         let errorReason = 'facilitator_error';
-        if (err instanceof Error && err.name === 'LockAcquireTimeoutError') {
+        if (err?.code === 'SUBMITTED_OUTCOME_UNKNOWN') {
+          errorReason = 'submitted_outcome_unknown';
+        } else if (err?.code === 'REQUEST_TIMEOUT') {
+          errorReason = 'request_timeout';
+        } else if (err instanceof Error && err.name === 'LockAcquireTimeoutError') {
           errorReason = 'lock_timeout';
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           errorReason = 'soroban_rpc_unreachable';
           audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'settle' });
         }
+
+        let transaction = '';
+        if (
+          body.paymentPayload?.transaction &&
+          typeof body.paymentPayload.transaction === 'string'
+        ) {
+          transaction = body.paymentPayload.transaction;
+        }
+
         return reply.send({
           success: false,
           errorReason,
           errorMessage: err instanceof Error ? err.message : String(err),
-          transaction: '',
-          network: req.body?.paymentRequirements?.network,
+          transaction,
+          network: req.body?.paymentRequirements?.network ?? '',
         });
       }
     },

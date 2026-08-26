@@ -58,14 +58,21 @@ export function createReadinessChecker(
   const call = rpcCall ?? ((url, body) => defaultRpcCall(url, body, timeoutMs));
   const targets = config.networks.map(network => {
     const netConfig = config.perNetwork[network];
+    let address = '';
+    try {
+      address = Keypair.fromSecret(netConfig.secret).publicKey();
+    } catch {
+      address = netConfig.secret ?? '';
+    }
     return {
       network,
       rpcUrl: netConfig.rpcUrl ?? (network === TESTNET ? DEFAULT_TESTNET_RPC : undefined),
-      address: Keypair.fromSecret(netConfig.secret).publicKey(),
+      address,
     };
   });
 
   let cache = null;
+  let isShuttingDown = false;
 
   async function checkRpc(target) {
     const res = await call(target.rpcUrl, {
@@ -127,6 +134,14 @@ export function createReadinessChecker(
   }
 
   async function check() {
+    if (isShuttingDown) {
+      return {
+        ok: false,
+        status: 'shutting_down',
+        checked_at: new Date().toISOString(),
+        reason: 'shutdown_in_progress',
+      };
+    }
     const fresh = cache && Date.now() - cache.checked_at_ms < cacheTtlMs;
     if (fresh) return cache.snapshot;
 
@@ -168,7 +183,12 @@ export function createReadinessChecker(
     cache = null;
   }
 
-  return { check, invalidate };
+  function setShuttingDown() {
+    isShuttingDown = true;
+    cache = null;
+  }
+
+  return { check, invalidate, setShuttingDown };
 }
 
 /**

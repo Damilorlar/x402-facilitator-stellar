@@ -220,5 +220,7 @@ export function resolveConfig(env = process.env) {
     rateLimits,
     embeddingsUrl: env.EMBEDDINGS_URL || null,
     enableReranking: env.ENABLE_RERANKING === 'true',
+    shutdownGraceMs: Number(env.SHUTDOWN_GRACE_MS ?? 15_000),
+    requestTimeoutMs: Number(env.REQUEST_TIMEOUT_MS ?? 30_000),
   };
 }

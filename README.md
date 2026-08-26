@@ -102,6 +102,7 @@ file entirely: there, the environment comes from the orchestrator.
 cp .env.example .env   # then fill in FACILITATOR_SECRET
 npm start              # or: npm run dev (adds --watch)
 curl localhost:3402/healthz
+curl localhost:3402/readyz
 ```
 
 `FACILITATOR_SECRET` is a signing key. `.env` is gitignored — never commit it.
