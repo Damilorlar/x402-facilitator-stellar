@@ -182,6 +182,7 @@ export function resolveConfig(env = process.env) {
     /** Optional shared stores. Unset means in-memory, single-instance. */
     redisUrl: env.REDIS_URL || null,
     databaseUrl: env.DATABASE_URL || null,
+    rateLimitStore: env.RATE_LIMIT_STORE || 'memory',
 
     /**
      * Redlock nodes (#116): comma-separated independent Redis masters. Quorum
@@ -192,6 +193,32 @@ export function resolveConfig(env = process.env) {
       .split(',')
       .map(s => s.trim())
       .filter(Boolean),
+
+    /**
+     * Multi-region failover (#126).
+     *
+     * REGION: this instance's region identifier (e.g. "us-east-1"). Unset
+     * means single-region; the CRDT rate limit store and failover health
+     * checker are disabled.
+     *
+     * REGIONS: comma-separated list of all regions and their priorities.
+     * Format: region:priority:healthUrl — e.g.
+     *   us-east-1:1:http://us-east-1.facilitator.example.com
+     *   eu-west-1:2:http://eu-west-1.facilitator.example.com
+     *
+     * RATE_LIMIT_STORE: when set to "crdt" (with DATABASE_URL pointing to a
+     * CockroachDB or multi-region Postgres cluster), uses the CRDT G-Counter
+     * store for region-aware rate limiting that survives partitions.
+     */
+    region: env.REGION || null,
+    regions: (env.REGIONS ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(entry => {
+        const [region, priority, url] = entry.split(':');
+        return { region, priority: Number(priority) || 1, url: url || null };
+      }),
 
     /**
      * Kafka (#117). Brokers unset means webhooks are delivered directly,

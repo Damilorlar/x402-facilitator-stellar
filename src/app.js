@@ -93,10 +93,11 @@ const PAYMENT_BODY_SCHEMA = {
  *   - audit: audit writer override (default createAuditLogger)
  *   - readiness: readiness checker override
  *   - breakerStates: breaker-state reader for the readiness probe (#105)
+ *   - failoverHealth (#126): region-aware failover health checker
  * @returns {import('fastify').FastifyInstance}
  */
 export function createApp(config, facilitator, rateLimiter, catalog, idempotency, extras = {}) {
-  const { distributedLock = null, webhooks = null } = extras;
+  const { distributedLock = null, webhooks = null, failoverHealth = null } = extras;
   const app = Fastify({
     // Client IP resolution. Unset leaves Fastify's default (off), correct where
     // the port is published directly — local development and docker-compose.
@@ -511,14 +512,21 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    */
   app.get('/health/ready', async (_req, reply) => {
     if (!readiness) {
-      return reply.code(503).send({
+      const response = {
         ok: false,
         status: 'not_ready',
         reason: 'readiness_not_configured',
-      });
+      };
+      if (failoverHealth) {
+        response.failover = failoverHealth.getState();
+      }
+      return reply.code(503).send(response);
     }
     try {
       const report = await readiness.check();
+      if (failoverHealth) {
+        report.failover = failoverHealth.getState();
+      }
       return reply.code(report.ok ? 200 : 503).send(report);
     } catch (err) {
       return reply.code(503).send({ ok: false, status: 'not_ready', error: err.message });
