@@ -181,9 +181,23 @@ describe('readiness checker', () => {
     assert.equal(report.catalog.ok, false);
     assert.match(report.catalog.error, /corrupted/);
   });
+
+  test('setShuttingDown flips check to ok: false and status: shutting_down', async () => {
+    const config = configWith([['stellar:testnet', 'http://rpc.test']]);
+    const checker = createReadinessChecker(config, {
+      rpcCall: rpcStub(),
+      cacheTtlMs: 0,
+    });
+    let report = await checker.check();
+    assert.equal(report.ok, true);
+    checker.setShuttingDown();
+    report = await checker.check();
+    assert.equal(report.ok, false);
+    assert.equal(report.status, 'shutting_down');
+  });
 });
 
-describe('GET /health/ready over HTTP', () => {
+describe('GET /readyz over HTTP', () => {
   test('503 with a body naming the failing dependency and network', async () => {
     const app = await serve({
       extras: {
@@ -204,7 +218,7 @@ describe('GET /health/ready over HTTP', () => {
       },
     });
     try {
-      const res = await app.get('/health/ready');
+      const res = await app.get('/readyz');
       assert.equal(res.status, 503);
       const body = await res.json();
       assert.equal(body.ok, false);
@@ -226,7 +240,7 @@ describe('GET /health/ready over HTTP', () => {
       },
     });
     try {
-      const res = await app.get('/health/ready');
+      const res = await app.get('/readyz');
       assert.equal(res.status, 200);
       assert.equal((await res.json()).status, 'ready');
     } finally {

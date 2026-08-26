@@ -127,6 +127,14 @@ export function createReadinessChecker(
   }
 
   async function check() {
+    if (isShuttingDown) {
+      return {
+        ok: false,
+        status: 'shutting_down',
+        checked_at: new Date().toISOString(),
+        reason: 'shutdown_in_progress',
+      };
+    }
     const fresh = cache && Date.now() - cache.checked_at_ms < cacheTtlMs;
     if (fresh) return cache.snapshot;
 
@@ -168,7 +176,12 @@ export function createReadinessChecker(
     cache = null;
   }
 
-  return { check, invalidate };
+  function setShuttingDown() {
+    isShuttingDown = true;
+    cache = null;
+  }
+
+  return { check, invalidate, setShuttingDown };
 }
 
 /**

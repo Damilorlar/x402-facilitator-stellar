@@ -13,7 +13,9 @@ export const LOCAL_REASONS = Object.freeze({
   catalog_error: 'An internal error occurred while cataloging the resource.',
   internal_error: 'An internal server error occurred.',
   soroban_rpc_unreachable: 'The Stellar RPC node is unreachable or the circuit breaker is open.',
-  lock_timeout: 'Timed out acquiring the distributed lock for settlement.'
+  lock_timeout: 'Timed out acquiring the distributed lock for settlement.',
+  request_timeout: 'The request timed out before completing.',
+  submitted_outcome_unknown: 'The settlement was submitted to the network, but timed out waiting for confirmation.'
 });
 
 export const UPSTREAM_REASONS = Object.freeze({
