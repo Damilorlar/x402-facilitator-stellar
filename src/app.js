@@ -42,6 +42,7 @@ import { validatePaymentBody } from './request-validation.js';
 import { createRequestLog } from './log.js';
 import { createMetrics } from './metrics.js';
 import { lockKeyFor } from './distributed-lock.js';
+import { requestState } from './request-state.js';
 
 /** 256kb body cap, carried over unchanged from the Express transport. */
 const BODY_LIMIT_BYTES = 256 * 1024;
@@ -145,19 +146,21 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   });
 
   /**
-   * Request correlation + structured logging (#7). One span per request:
-   *
-   *   - honour an inbound X-Request-Id, else mint one (crypto.randomUUID) and
-   *     echo it on the response so a resource server can hand us a single id;
-   *   - the request logger emits exactly one redacted JSON line per request via
-   *     its own onResponse hook below — never the auth entry, the raw
-   *     transaction, API keys or the facilitator secret.
+   * In-flight request tracking for graceful shutdown (#248) combined with
+   * request correlation + structured logging (#7).
    */
+  let activeRequestCount = 0;
+  app.decorate('getInFlightCount', () => activeRequestCount);
+
   app.addHook('onRequest', (req, reply, done) => {
+    activeRequestCount++;
     const span = logger.begin(req);
     req.span = span;
     reply.header('X-Request-Id', span.requestId);
-    done?.();
+    // Async-local request state for the shutdown drain (#248).
+    requestState.run({ submitted: false }, () => {
+      done?.();
+    });
   });
 
   /**
@@ -173,13 +176,21 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    */
   const OPERATIONAL_ROUTES = new Set(['/metrics', '/healthz', '/health/ready']);
   app.addHook('onResponse', (req, reply, done) => {
+    activeRequestCount = Math.max(0, activeRequestCount - 1);
     const span = req.span;
     if (!span) return done?.();
 
     const status = reply.statusCode;
-    const outcome = span.outcome ?? (status >= 500 ? 'error' : status >= 400 ? 'rejected' : 'ok');
+    const outcome =
+      span.outcome ??
+      (status >= 500 ? 'error' : status >= 400 ? 'rejected' : 'ok');
     const reason =
-      span.reason ?? (status >= 500 ? 'server_error' : status >= 400 ? 'client_error' : 'none');
+      span.reason ??
+      (status >= 500
+        ? 'server_error'
+        : status >= 400
+          ? 'client_error'
+          : 'none');
 
     logger.finish(span, { outcome, reason });
 
@@ -226,6 +237,8 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           catalog,
         })
       : null);
+
+  app.decorate('readiness', readiness);
 
   /**
    * Security headers (#86), hand-set rather than via helmet.
@@ -449,11 +462,16 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     // The presented key material itself is deliberately never recorded.
     const reject = reason => {
       audit('auth_failure', { actor: `ip:${req.ip}`, reason });
-      reply.code(401).send({ error: 'unauthorized', reason });
+      reply
+        .code(401)
+        .send({ isValid: false, invalidReason: reason, invalidMessage: 'unauthorized', reason });
     };
 
     const authHeader = req.headers.authorization;
     if (!authHeader) return reject('missing_auth_header');
+    if (authHeader === 'Bearer' || authHeader === 'Bearer ') {
+      return reject('malformed_auth_header');
+    }
 
     let presentedKey = '';
     if (authHeader.startsWith('Bearer ')) {
@@ -492,7 +510,11 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    */
   async function requireApiKeyStrict(req, reply) {
     if (config.apiKeys.length === 0) {
-      reply.code(401).send({ error: 'unauthorized', reason: 'open_mode_usage_forbidden' });
+      reply.code(401).send({
+        isValid: false,
+        invalidReason: 'open_mode_usage_forbidden',
+        invalidMessage: 'unauthorized',
+      });
       return;
     }
     return requireApiKey(req, reply);
@@ -519,7 +541,12 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           'Retry-After',
           Math.max(1, checkResult.resetAt - Math.floor(Date.now() / 1000)),
         );
-        return reply.code(429).send({ error: 'rate_limited', reason: checkResult.reason });
+        return reply.code(429).send({
+          isValid: false,
+          invalidReason: 'rate_limited',
+          invalidMessage: checkResult.reason,
+          reason: checkResult.reason,
+        });
       }
     }
     return null;
@@ -583,14 +610,14 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   app.get('/healthz', async () => ({ ok: true }));
 
   /**
-   * GET /health/ready — the readiness probe (#100).
+   * GET /readyz — the readiness probe (#100, #8).
    *
    * Unlike /healthz this CAN fail: 503 names which check failed for which
    * network. Result is cached and bounded by its own timeout — see
    * src/readiness.js. Catalogue trouble is reported but never fails readiness:
    * a cataloguing failure must never fail a payment.
    */
-  app.get('/health/ready', async (_req, reply) => {
+  app.get('/readyz', async (_req, reply) => {
     if (!readiness) {
       return reply.code(503).send({
         ok: false,
@@ -655,7 +682,21 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       try {
         await rateLimiter.recordVerify(req);
         handleRateLimit(reply, check);
-        const result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
+        const timeoutMs = config.requestTimeoutMs ?? 30_000;
+        let timeoutTimer;
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            const err = new Error('request timeout');
+            err.code = 'REQUEST_TIMEOUT';
+            reject(err);
+          }, timeoutMs);
+        });
+
+        const verifyPromise = facilitator.verify(body.paymentPayload, body.paymentRequirements);
+        const result = await Promise.race([verifyPromise, timeoutPromise]).finally(() => {
+          clearTimeout(timeoutTimer);
+        });
+
         if (req.span) {
           req.span.outcome = result.isValid ? 'ok' : 'rejected';
           req.span.reason = result.isValid ? 'none' : (result.invalidReason ?? 'invalid');
@@ -683,14 +724,22 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         //
         // An open RPC breaker gets its own code so a caller can tell "the chain
         // is unreachable" from "your payment was rejected" (#105, #6).
-        const invalidReason =
-          err?.code === 'RPC_BREAKER_OPEN' ? 'soroban_rpc_unreachable' : 'facilitator_error';
+        let invalidReason = 'facilitator_error';
+        if (err?.code === 'REQUEST_TIMEOUT') {
+          invalidReason = 'request_timeout';
+        } else if (err?.code === 'RPC_BREAKER_OPEN') {
+          invalidReason = 'soroban_rpc_unreachable';
+        }
         if (req.span) {
           req.span.outcome = 'error';
           req.span.reason = invalidReason;
         }
         if (invalidReason !== 'facilitator_error') {
-          audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'verify' });
+          audit('rpc_unreachable', {
+            actor: req.keyId ?? `ip:${req.ip}`,
+            op: 'verify',
+            reason: invalidReason,
+          });
         }
         return reply.send({
           isValid: false,
@@ -804,9 +853,28 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           }
         };
 
-        const result = distributedLock
-          ? await distributedLock.withLock(lockKey, settleOnce)
-          : await settleOnce();
+        const timeoutMs = config.requestTimeoutMs ?? 30_000;
+        let timeoutTimer;
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            const isSubmitted = requestState.getStore()?.submitted === true;
+            const err = new Error(
+              isSubmitted
+                ? 'settlement submitted to network but timed out waiting for confirmation'
+                : 'request timeout',
+            );
+            err.code = isSubmitted ? 'SUBMITTED_OUTCOME_UNKNOWN' : 'REQUEST_TIMEOUT';
+            reject(err);
+          }, timeoutMs);
+        });
+
+        const resultPromise = distributedLock
+          ? distributedLock.withLock(lockKey, settleOnce)
+          : settleOnce();
+
+        const result = await Promise.race([resultPromise, timeoutPromise]).finally(() => {
+          clearTimeout(timeoutTimer);
+        });
         return reply.send(result);
       } catch (err) {
         // SettleResponse requires `transaction` and `network` even on failure, so
@@ -816,7 +884,11 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         // and an open RPC breaker gets its own code so a caller can tell "the
         // chain is unreachable" from "your payment was rejected" (#105, #6).
         let errorReason = 'facilitator_error';
-        if (err instanceof Error && err.name === 'LockAcquireTimeoutError') {
+        if (err?.code === 'SUBMITTED_OUTCOME_UNKNOWN') {
+          errorReason = 'submitted_outcome_unknown';
+        } else if (err?.code === 'REQUEST_TIMEOUT') {
+          errorReason = 'request_timeout';
+        } else if (err instanceof Error && err.name === 'LockAcquireTimeoutError') {
           errorReason = 'lock_timeout';
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           errorReason = 'soroban_rpc_unreachable';
@@ -827,12 +899,20 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           req.span.reason = errorReason;
           req.span.settleOutcome = 'failed';
         }
+
+        let transaction = '';
+        if (
+          body.paymentPayload?.transaction &&
+          typeof body.paymentPayload.transaction === 'string'
+        ) {
+          transaction = body.paymentPayload.transaction;
+        }
         return reply.send({
           success: false,
           errorReason,
           errorMessage: err instanceof Error ? err.message : String(err),
-          transaction: '',
-          network: req.body?.paymentRequirements?.network,
+          transaction,
+          network: req.body?.paymentRequirements?.network ?? '',
         });
       }
     },

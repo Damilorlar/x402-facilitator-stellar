@@ -52,6 +52,7 @@
  */
 
 import { createRequire } from 'node:module';
+import { requestState } from './request-state.js';
 
 const require = createRequire(import.meta.url);
 
@@ -206,6 +207,12 @@ export function installRpcRetry({
     // breaker. A settle whose broadcast went out must ride out a trip that
     // happens between its own retries.
     const protectedCall = isSendTransaction(input, init);
+    if (protectedCall) {
+      const store = requestState.getStore();
+      if (store) {
+        store.submitted = true;
+      }
+    }
 
     if (!protectedCall && !gate(b, host)) {
       throw new RpcBreakerOpenError(host);

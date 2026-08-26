@@ -174,15 +174,38 @@ app.listen({ port: config.port, host: '0.0.0.0' }, () => {
  */
 async function shutdown(signal) {
   console.log(`${signal} received — draining`);
-  try {
-    await app.close();
-    await new Promise(resolve => (metricsServerRef ? metricsServerRef.close(resolve) : resolve()));
-    await webhooks.stop().catch(() => {});
-    await distributedLock?.quit().catch(() => {});
-    horizon.restore();
-  } finally {
-    process.exit(0);
+  if (app.readiness && typeof app.readiness.setShuttingDown === 'function') {
+    app.readiness.setShuttingDown();
   }
+
+  const graceMs = config.shutdownGraceMs ?? 15_000;
+  let forceExitTimer;
+
+  const shutdownPromise = (async () => {
+    try {
+      await app.close();
+      await new Promise(resolve => (metricsServerRef ? metricsServerRef.close(resolve) : resolve()));
+      await webhooks.stop().catch(() => {});
+      await distributedLock?.quit().catch(() => {});
+      horizon.restore();
+    } catch (err) {
+      console.error(`Error during shutdown: ${err.message}`);
+    }
+  })();
+
+  const timeoutPromise = new Promise(resolve => {
+    forceExitTimer = setTimeout(() => {
+      const inFlight = typeof app.getInFlightCount === 'function' ? app.getInFlightCount() : 0;
+      console.warn(
+        `[Shutdown] Deadline of ${graceMs}ms reached; ${inFlight} request(s) still in flight.`,
+      );
+      resolve('timeout');
+    }, graceMs);
+  });
+
+  await Promise.race([shutdownPromise, timeoutPromise]);
+  clearTimeout(forceExitTimer);
+  process.exit(0);
 }
 
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
