@@ -42,6 +42,7 @@ import { validatePaymentBody } from './request-validation.js';
 import { requestLogger } from './logger.js';
 import { lockKeyFor } from './distributed-lock.js';
 import { requestState } from './request-state.js';
+import { signerMetrics } from './metrics.js';
 
 /** 256kb body cap, carried over unchanged from the Express transport. */
 const BODY_LIMIT_BYTES = 256 * 1024;
