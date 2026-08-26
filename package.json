@@ -40,7 +40,12 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "licenses": "node scripts/check-licenses.mjs",
-    "eval": "node eval/runner.js"
+    "eval": "node eval/runner.js",
+    "bench": "node scripts/bench-http.mjs",
+    "env:check": "node scripts/check-env-doc.mjs",
+    "smoke:examples": "node scripts/smoke-examples.mjs",
+    "testnet:fund": "node scripts/fund-testnet-accounts.mjs",
+    "testnet:usdc": "node scripts/prepare-testnet-usdc.mjs"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.2.0",
