@@ -915,6 +915,34 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   );
 
   /**
+   * GET /settlements/:idempotencyKey/events — full, ordered event history for
+   * one settlement (#130). The projection above answers "what is the current
+   * state"; this answers "how did it get there" — the record a regulatory
+   * audit needs. Scoped identically to the settlement it belongs to.
+   */
+  app.get(
+    '/settlements/:idempotencyKey/events',
+    {
+      onRequest: cors('authenticated'),
+      preHandler: requireApiKey,
+    },
+    async (req, reply) => {
+      const { idempotencyKey } = req.params;
+      const record = await settlementStore.get(idempotencyKey);
+      if (!record) {
+        return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
+      }
+
+      if (req.keyId && record.key_id && record.key_id !== req.keyId) {
+        return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
+      }
+
+      const events = await settlementStore.getEventLog(idempotencyKey);
+      return reply.send({ ok: true, idempotencyKey, events });
+    },
+  );
+
+  /**
    * Manual registration, the secondary path.
    *
    * Automatic cataloging off the payment path is the primary one — anything
