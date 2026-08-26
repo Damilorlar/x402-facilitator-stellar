@@ -308,6 +308,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * is logged, never surfaced as a payment failure.
    */
   async function processCataloging(req, body, reply, source = 'payment') {
+    try {
     const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
     const outcome = {};
 
@@ -378,6 +379,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       'EXTENSION-RESPONSES',
       Buffer.from(JSON.stringify({ bazaar: outcome })).toString('base64'),
     );
+    } catch (err) {
+      console.error('[Catalog] Unhandled error during processCataloging:', err);
+    }
   }
 
   /**
@@ -769,10 +773,10 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       try {
         const settleOnce = async () => {
           const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
-          await rateLimiter.recordSettle(
-            req,
-            result.success ? result.transactionFeeStroops || 0 : 0,
-          );
+          const network = body.paymentRequirements.network;
+          const maxFee = config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000;
+          const feeCharged = result.success ? maxFee : 0;
+          await rateLimiter.recordSettle(req, feeCharged);
           handleRateLimit(reply, check);
           if (result.success) {
             await settlementStore.updateState(idempotencyKey, 'settled', {
