@@ -58,16 +58,16 @@ export function createReadinessChecker(
   const call = rpcCall ?? ((url, body) => defaultRpcCall(url, body, timeoutMs));
   const targets = config.networks.map(network => {
     const netConfig = config.perNetwork[network];
-    let address = '';
-    try {
-      address = Keypair.fromSecret(netConfig.secret).publicKey();
-    } catch {
-      address = netConfig.secret ?? '';
-    }
+    const secrets = netConfig.secrets ?? (netConfig.secret ? [netConfig.secret] : []);
+    const addresses = secrets.map(sec => Keypair.fromSecret(sec).publicKey());
+    const feeBumpAddress = netConfig.feeBumpSecret
+      ? Keypair.fromSecret(netConfig.feeBumpSecret).publicKey()
+      : null;
     return {
       network,
       rpcUrl: netConfig.rpcUrl ?? (network === TESTNET ? DEFAULT_TESTNET_RPC : undefined),
-      address,
+      addresses,
+      feeBumpAddress,
     };
   });
 
@@ -86,10 +86,10 @@ export function createReadinessChecker(
       : { ok: false, error: `rpc health '${status}' is not 'healthy'` };
   }
 
-  async function checkSigner(target) {
-    const accountId = Keypair.fromPublicKey(target.address).xdrAccountId();
+  async function checkSignerAddress(rpcUrl, address) {
+    const accountId = Keypair.fromPublicKey(address).xdrAccountId();
     const key = xdr.LedgerKey.account(new xdr.LedgerKeyAccount({ accountId }));
-    const res = await call(target.rpcUrl, {
+    const res = await call(rpcUrl, {
       jsonrpc: '2.0',
       id: 2,
       method: 'getLedgerEntries',
@@ -97,18 +97,40 @@ export function createReadinessChecker(
     });
     const entries = res?.result?.entries ?? [];
     if (entries.length === 0) {
-      return { ok: false, error: 'signer account does not exist (unfunded)' };
+      return { ok: false, address, error: `signer account ${address} does not exist (unfunded)` };
     }
     const entryData = xdr.LedgerEntryData.fromXDR(entries[0].val, 'base64');
     const balance = Number(entryData.account().balance());
     if (balance < minBalanceStroops) {
       return {
         ok: false,
+        address,
         balance_stroops: balance,
-        error: `signer balance ${balance} is below floor ${minBalanceStroops}`,
+        error: `signer ${address} balance ${balance} is below floor ${minBalanceStroops}`,
       };
     }
-    return { ok: true, balance_stroops: balance };
+    return { ok: true, address, balance_stroops: balance };
+  }
+
+  async function checkSigners(target) {
+    const results = [];
+    for (const addr of target.addresses) {
+      results.push(await checkSignerAddress(target.rpcUrl, addr));
+    }
+    if (target.feeBumpAddress) {
+      results.push(await checkSignerAddress(target.rpcUrl, target.feeBumpAddress));
+    }
+
+    const allOk = results.every(r => r.ok);
+    if (!allOk) {
+      const failing = results.filter(r => !r.ok);
+      return {
+        ok: false,
+        error: failing.map(f => f.error).join('; '),
+        signers: results,
+      };
+    }
+    return { ok: true, signers: results };
   }
 
   async function checkNetwork(target) {
@@ -120,7 +142,7 @@ export function createReadinessChecker(
     }
     let signer;
     try {
-      signer = await checkSigner(target);
+      signer = await checkSigners(target);
     } catch (err) {
       signer = { ok: false, error: err.message };
     }
