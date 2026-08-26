@@ -87,29 +87,33 @@ export function createReadinessChecker(
   }
 
   async function checkSignerAddress(rpcUrl, address) {
-    const accountId = Keypair.fromPublicKey(address).xdrAccountId();
-    const key = xdr.LedgerKey.account(new xdr.LedgerKeyAccount({ accountId }));
-    const res = await call(rpcUrl, {
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'getLedgerEntries',
-      params: { keys: [key.toXDR('base64')] },
-    });
-    const entries = res?.result?.entries ?? [];
-    if (entries.length === 0) {
-      return { ok: false, address, error: `signer account ${address} does not exist (unfunded)` };
+    try {
+      const accountId = Keypair.fromPublicKey(address).xdrAccountId();
+      const key = xdr.LedgerKey.account(new xdr.LedgerKeyAccount({ accountId }));
+      const res = await call(rpcUrl, {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'getLedgerEntries',
+        params: { keys: [key.toXDR('base64')] },
+      });
+      const entries = res?.result?.entries ?? [];
+      if (entries.length === 0) {
+        return { ok: false, address, error: `signer account ${address} does not exist (unfunded)` };
+      }
+      const entryData = xdr.LedgerEntryData.fromXDR(entries[0].val, 'base64');
+      const balance = Number(entryData.account().balance());
+      if (balance < minBalanceStroops) {
+        return {
+          ok: false,
+          address,
+          balance_stroops: balance,
+          error: `signer ${address} balance ${balance} is below floor ${minBalanceStroops}`,
+        };
+      }
+      return { ok: true, address, balance_stroops: balance };
+    } catch (err) {
+      return { ok: false, address, error: err.message };
     }
-    const entryData = xdr.LedgerEntryData.fromXDR(entries[0].val, 'base64');
-    const balance = Number(entryData.account().balance());
-    if (balance < minBalanceStroops) {
-      return {
-        ok: false,
-        address,
-        balance_stroops: balance,
-        error: `signer ${address} balance ${balance} is below floor ${minBalanceStroops}`,
-      };
-    }
-    return { ok: true, address, balance_stroops: balance };
   }
 
   async function checkSigners(target) {
@@ -122,15 +126,17 @@ export function createReadinessChecker(
     }
 
     const allOk = results.every(r => r.ok);
+    const firstBalance = results[0]?.balance_stroops;
     if (!allOk) {
       const failing = results.filter(r => !r.ok);
       return {
         ok: false,
+        balance_stroops: firstBalance,
         error: failing.map(f => f.error).join('; '),
         signers: results,
       };
     }
-    return { ok: true, signers: results };
+    return { ok: true, balance_stroops: firstBalance, signers: results };
   }
 
   async function checkNetwork(target) {
