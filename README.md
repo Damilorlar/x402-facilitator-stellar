@@ -81,7 +81,8 @@ Reference material: [Architecture](docs/ARCHITECTURE.md) ·
 [Conformance](docs/CONFORMANCE.md) · [Deployment](docs/DEPLOYMENT.md) ·
 [Operations](docs/OPERATIONS.md) · [Authentication](docs/AUTHENTICATION.md) ·
 [Threat model](docs/THREAT-MODEL.md) · [Audit readiness](docs/AUDIT.md) ·
-[Privacy](docs/PRIVACY.md) · [Glossary](docs/GLOSSARY.md)
+[Privacy](docs/PRIVACY.md) · [Upstream tracking](docs/UPSTREAM.md) ·
+[Glossary](docs/GLOSSARY.md)
 
 Sibling repositories in the [Accensa organisation](https://github.com/accensa):
 [`accensa-app`](https://github.com/accensa/accensa-app) (merchant dashboard, indexer,

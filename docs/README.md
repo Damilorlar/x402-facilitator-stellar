@@ -8,4 +8,5 @@ Welcome to the X402 Facilitator documentation. Please choose the path that best 
 
 **Reference:**
 - [Architecture](./ARCHITECTURE.md): System design, components, and the discovery path
+- [Upstream tracking & spec-drift policy](./UPSTREAM.md): how we watch `@x402/*` and the spec for drift
 - [Glossary](./GLOSSARY.md): Terminology (Stellar, X402, and Facilitator concepts)
