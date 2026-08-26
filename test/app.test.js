@@ -367,9 +367,9 @@ describe('rate limiting', () => {
         const retryAfter = Number(res.headers.get('retry-after'));
         assert.ok(retryAfter >= 1, 'Retry-After must be a positive number of seconds');
         const json = await res.json();
-        assert.equal(json.error, 'rate_limited');
+        assert.equal(json.isValid, false);
         // An agent has to be able to back off on a code rather than parse prose.
-        assert.ok(json.reason, 'a 429 must carry a reason');
+        assert.ok(json.invalidReason, 'a 429 must carry a reason');
       } finally {
         await app.close();
       }
@@ -408,7 +408,7 @@ describe('GET /usage', () => {
     try {
       const res = await app.get('/usage');
       assert.equal(res.status, 401);
-      assert.equal((await res.json()).reason, 'open_mode_usage_forbidden');
+      assert.equal((await res.json()).invalidReason, 'open_mode_usage_forbidden');
     } finally {
       await app.close();
     }
