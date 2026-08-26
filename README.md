@@ -182,8 +182,7 @@ to reproduce both results, is in [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md).
 
 Responses use the canonical field names — `VerifyResponse` carries `invalidReason` and
 `invalidMessage`; `SettleResponse` carries `errorReason`, `errorMessage`, `transaction`
-and `network`. There is no `reason` field, and inventing one produces a service that looks
-correct locally and is non-conformant on the wire.
+and `network`. The transport-layer HTTP rejections (such as 401 Unauthorized or 429 Too Many Requests) also conform to the `VerifyResponse` shape to ensure a client has one parser, not three. For an exhaustive taxonomy of all emitted reasons, see [REASONS.md](docs/REASONS.md).
 
 ## Known Gaps
 
