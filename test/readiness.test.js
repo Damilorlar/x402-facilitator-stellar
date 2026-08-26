@@ -69,7 +69,10 @@ function rpcStub({
       return { result: { status: healthy ? 'healthy' : 'degraded' } };
     }
     if (body.method === 'getLedgerEntries') {
-      return { result: { entries: entryVal ? [{ val: entryVal }] : [] } };
+      // Soroban RPC returns the entry's ledger data under `xdr` (shape:
+      // key/xdr/lastModifiedLedgerSeq/extXdr). The stub must mirror the real
+      // wire shape or the checker can pass tests while failing in production.
+      return { result: { entries: entryVal ? [{ xdr: entryVal }] : [] } };
     }
     throw new Error(`unexpected method ${body.method}`);
   };
@@ -129,7 +132,8 @@ describe('readiness checker', () => {
     const poorReport = await poor.check();
     const signer = poorReport.networks['stellar:testnet'].checks.signer_funded;
     assert.equal(signer.ok, false);
-    assert.equal(signer.balance_stroops, 500);
+    // Multi-signer: individual signer results are in signer.signers[]
+    assert.equal(signer.signers[0].balance_stroops, 500);
     assert.match(signer.error, /below floor 1000000/);
   });
 

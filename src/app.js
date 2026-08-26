@@ -43,6 +43,8 @@ import { createRequestLog } from './log.js';
 import { createMetrics } from './metrics.js';
 import { lockKeyFor } from './distributed-lock.js';
 import { requestState } from './request-state.js';
+import { signerMetrics } from './metrics.js';
+import { buildSettlementStore } from './store/index.js';
 
 /** 256kb body cap, carried over unchanged from the Express transport. */
 const BODY_LIMIT_BYTES = 256 * 1024;
@@ -95,9 +97,11 @@ const PAYMENT_BODY_SCHEMA = {
  *   - audit: audit writer override (default createAuditLogger)
  *   - readiness: readiness checker override
  *   - breakerStates: breaker-state reader for the readiness probe (#105)
+ *   - failoverHealth (#126): region-aware failover health checker
  * @returns {import('fastify').FastifyInstance}
  */
 export function createApp(config, facilitator, rateLimiter, catalog, idempotency, extras = {}) {
+ feat/observability
   const { distributedLock = null, webhooks = null } = extras;
 
   // Observability collaborators. Both are injectable so tests can capture the
@@ -119,6 +123,14 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   // set, server.js runs a separate listener for it and passes serveMetrics:false.
   const serveMetrics = extras.serveMetrics !== false;
 
+
+  const { distributedLock = null, webhooks = null, failoverHealth = null } = extras;
+  const {
+    distributedLock = null,
+    webhooks = null,
+    settlementStore = extras.settlementStore ?? buildSettlementStore(config),
+  } = extras;
+ main
   const app = Fastify({
     // Client IP resolution. Unset leaves Fastify's default (off), correct where
     // the port is published directly — local development and docker-compose.
@@ -377,6 +389,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * is logged, never surfaced as a payment failure.
    */
   async function processCataloging(req, body, reply, source = 'payment') {
+    try {
     const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
     const outcome = {};
 
@@ -447,6 +460,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       'EXTENSION-RESPONSES',
       Buffer.from(JSON.stringify({ bazaar: outcome })).toString('base64'),
     );
+    } catch (err) {
+      console.error('[Catalog] Unhandled error during processCataloging:', err);
+    }
   }
 
   /**
@@ -479,13 +495,11 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     } else if (!authHeader.includes(' ')) {
       presentedKey = authHeader;
     } else {
-      reject('malformed_auth_header');
-      return;
+      return reject('malformed_auth_header');
     }
 
     if (!presentedKey || presentedKey.includes(' ')) {
-      reject('malformed_auth_header');
-      return;
+      return reject('malformed_auth_header');
     }
 
     const presentedHash = crypto.createHash('sha256').update(presentedKey).digest();
@@ -609,6 +623,11 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
 
   app.get('/healthz', async () => ({ ok: true }));
 
+  app.get('/metrics', async (_req, reply) => {
+    reply.header('content-type', 'text/plain; version=0.0.4; charset=utf-8');
+    return reply.send(signerMetrics.toPrometheusText());
+  });
+
   /**
    * GET /readyz — the readiness probe (#100, #8).
    *
@@ -619,14 +638,21 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    */
   app.get('/readyz', async (_req, reply) => {
     if (!readiness) {
-      return reply.code(503).send({
+      const response = {
         ok: false,
         status: 'not_ready',
         reason: 'readiness_not_configured',
-      });
+      };
+      if (failoverHealth) {
+        response.failover = failoverHealth.getState();
+      }
+      return reply.code(503).send(response);
     }
     try {
       const report = await readiness.check();
+      if (failoverHealth) {
+        report.failover = failoverHealth.getState();
+      }
       return reply.code(report.ok ? 200 : 503).send(report);
     } catch (err) {
       return reply.code(503).send({ ok: false, status: 'not_ready', error: err.message });
@@ -771,6 +797,77 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         req.span.scheme = body.paymentRequirements.scheme;
       }
 
+      const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
+      const existingRecord = await settlementStore.get(idempotencyKey);
+
+      if (existingRecord) {
+        if (existingRecord.state === 'settled') {
+          handleRateLimit(reply, check);
+          if (existingRecord.response) {
+            const respPayload =
+              typeof existingRecord.response === 'string'
+                ? JSON.parse(existingRecord.response)
+                : existingRecord.response;
+            return reply.send(respPayload);
+          }
+          return reply.send({
+            success: true,
+            transaction: existingRecord.tx_hash,
+            network: existingRecord.network,
+            payer: existingRecord.payer,
+          });
+        }
+        if (existingRecord.state === 'submitted' || existingRecord.state === 'unknown') {
+          handleRateLimit(reply, check);
+          return reply.send({
+            success: false,
+            errorReason: 'submitted_outcome_unknown',
+            errorMessage:
+              existingRecord.error_message || 'settlement in progress or outcome unknown',
+            transaction: existingRecord.tx_hash || '',
+            network: existingRecord.network,
+          });
+        }
+        if (existingRecord.state === 'failed') {
+          const RETRYABLE = new Set([
+            'rate_limited',
+            'catalog_rate_limited',
+            'soroban_rpc_unreachable',
+            'lock_timeout',
+            'request_timeout',
+          ]);
+          if (!RETRYABLE.has(existingRecord.error_reason)) {
+            handleRateLimit(reply, check);
+            if (existingRecord.response) {
+              const respPayload =
+                typeof existingRecord.response === 'string'
+                  ? JSON.parse(existingRecord.response)
+                  : existingRecord.response;
+              return reply.send(respPayload);
+            }
+            return reply.send({
+              success: false,
+              errorReason: existingRecord.error_reason,
+              errorMessage: existingRecord.error_message,
+              transaction: existingRecord.tx_hash || '',
+              network: existingRecord.network,
+            });
+          }
+        }
+      }
+
+      await settlementStore.save({
+        idempotency_key: idempotencyKey,
+        network: body.paymentRequirements.network,
+        scheme: body.paymentRequirements.scheme,
+        payer: body.paymentPayload?.payer ?? null,
+        pay_to: body.paymentRequirements.payTo,
+        asset: body.paymentRequirements.asset,
+        amount: body.paymentRequirements.maxAmountRequired,
+        state: 'submitted',
+        key_id: req.keyId ?? null,
+      });
+
       /**
        * Exact-once settlement: a repeated idempotency key replays the recorded
        * response instead of touching the chain again. The key is client-supplied
@@ -797,6 +894,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
 
       try {
         const settleOnce = async () => {
+ feat/observability
           // Sequence-contention signal (#9): this signer is now mid-settlement.
           if (signer) metrics.setSignerInflight({ network, signer, value: 1 });
           try {
@@ -836,6 +934,47 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
             if (idempotency && replay) {
               await idempotency.complete(replay.key, 200, result);
             }
+
+          const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
+          const network = body.paymentRequirements.network;
+          const maxFee = config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000;
+          const feeCharged = result.success ? maxFee : 0;
+          await rateLimiter.recordSettle(req, feeCharged);
+          handleRateLimit(reply, check);
+          if (result.success) {
+            await settlementStore.updateState(idempotencyKey, 'settled', {
+              tx_hash: result.transaction,
+              response: result,
+            });
+
+            await processCataloging(req, body, reply, 'payment');
+
+            // Webhook notification (#117): published, not delivered inline.
+            // A slow receiving server must never sit inside this HTTP
+            // request's lifecycle — see src/webhooks/.
+            if (webhooks && typeof webhooks.enqueue === 'function') {
+              webhooks.enqueue({
+                type: 'settlement.completed',
+                transaction: result.transaction,
+                network: result.network,
+                payer: result.payer,
+                payTo: body.paymentRequirements.payTo,
+                amount: body.paymentRequirements.maxAmountRequired,
+                asset: body.paymentRequirements.asset,
+              });
+            }
+          } else {
+            await settlementStore.updateState(idempotencyKey, 'failed', {
+              tx_hash: result.transaction || null,
+              error_reason: result.errorReason || 'facilitator_error',
+              error_message: result.errorMessage || null,
+              response: result,
+            });
+          }
+          if (idempotency && replay) {
+            await idempotency.complete(replay.key, 200, result);
+          }
+ main
 
             // Settlements are THE auditable record: which authenticated caller moved
             // money, and the transaction hash to reconstruct it by.
@@ -907,6 +1046,16 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         ) {
           transaction = body.paymentPayload.transaction;
         }
+ feat/observability
+
+
+        const targetState = errorReason === 'submitted_outcome_unknown' ? 'unknown' : 'failed';
+        await settlementStore.updateState(idempotencyKey, targetState, {
+          tx_hash: transaction,
+          error_reason: errorReason,
+          error_message: err instanceof Error ? err.message : String(err),
+        });
+ main
         return reply.send({
           success: false,
           errorReason,
@@ -915,6 +1064,59 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           network: req.body?.paymentRequirements?.network ?? '',
         });
       }
+    },
+  );
+
+  /**
+   * GET /settlements/:idempotencyKey — Settlement status read API (#10).
+   * Scoped to the authenticated caller's keyId.
+   */
+  app.get(
+    '/settlements/:idempotencyKey',
+    {
+      onRequest: cors('authenticated'),
+      preHandler: requireApiKey,
+    },
+    async (req, reply) => {
+      const { idempotencyKey } = req.params;
+      const record = await settlementStore.get(idempotencyKey);
+      if (!record) {
+        return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
+      }
+
+      if (req.keyId && record.key_id && record.key_id !== req.keyId) {
+        return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
+      }
+
+      return reply.send({ ok: true, settlement: record });
+    },
+  );
+
+  /**
+   * GET /settlements/:idempotencyKey/events — full, ordered event history for
+   * one settlement (#130). The projection above answers "what is the current
+   * state"; this answers "how did it get there" — the record a regulatory
+   * audit needs. Scoped identically to the settlement it belongs to.
+   */
+  app.get(
+    '/settlements/:idempotencyKey/events',
+    {
+      onRequest: cors('authenticated'),
+      preHandler: requireApiKey,
+    },
+    async (req, reply) => {
+      const { idempotencyKey } = req.params;
+      const record = await settlementStore.get(idempotencyKey);
+      if (!record) {
+        return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
+      }
+
+      if (req.keyId && record.key_id && record.key_id !== req.keyId) {
+        return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
+      }
+
+      const events = await settlementStore.getEventLog(idempotencyKey);
+      return reply.send({ ok: true, idempotencyKey, events });
     },
   );
 
