@@ -132,53 +132,31 @@ For detailed information, see our [Privacy Policy](docs/PRIVACY.md).
 
 ## Conformance
 
-Acceptance is tested at the wire level with stock SDK code, not by reading a claim. What
-holds today on testnet:
+Acceptance is tested at the wire level with stock SDK code, not by reading a claim. The
+canonical, citable report — with versions, per-item evidence, settled transaction hashes,
+what fails and why, and commands to reproduce it yourself — is
+[`docs/CONFORMANCE.md`](docs/CONFORMANCE.md). CI fails the build if that report goes stale
+relative to `main` ([`ci.yml`](.github/workflows/ci.yml)).
 
-- [x] `/supported` emits the Stellar `extra` block including `areFeesSponsored`
-- [x] Every rejection carries a non-null `invalidReason` — across malformed bodies,
-      unregistered scheme/network pairs, and scheme-level failures
-- [x] The spec's `payload: {transaction}` shape is accepted verbatim
-- [x] **An unmodified canonical client completes a payment end-to-end**
-- [x] **Settled transaction hash published** — two, below
-- [ ] The x402 repository's e2e suite — **1 of 5 server components passes**
-- [ ] `stellar:pubnet`
+Summary (full detail and evidence in the report):
 
-### Settled on Stellar testnet, 2026-08-14
+- ✅ **An unmodified canonical client completes a payment end-to-end** on `stellar:testnet`
+  / `exact`, fee sponsored by the facilitator. Two settled hashes published:
+  [`5f1bd15a…5558`](https://stellar.expert/explorer/testnet/tx/5f1bd15aec8ca3c6390689ed7fed82506f6c3d8eb8ed325a05a8b83974925558)
+  and
+  [`ff798145…0590`](https://stellar.expert/explorer/testnet/tx/ff798145681ad66e20f39f60d91895e993bc8033bbc78847aa5ddf0ee1e70590).
+- ✅ `/supported` emits `extra.areFeesSponsored`; every rejection carries a non-null reason;
+  `payload: {transaction}` accepted verbatim.
+- 🟡 Upstream e2e suite, testnet: **1 of 5 server components passes** (`next`; `express`,
+  `fastify`, `hono`, `mcp` fail, structural — tracked in
+  [#64](https://github.com/accensa/x402-facilitator-stellar/issues/64)).
+- ⬜ `stellar:pubnet` and the pubnet half of the upstream suite — blocked on
+  [#17](https://github.com/accensa/x402-facilitator-stellar/issues/17).
+- ❌ Bazaar listing rejected by a third-party client (`invalid_routeTemplate`,
+  [#65](https://github.com/accensa/x402-facilitator-stellar/issues/65)); `__check_auth`
+  smart-account payer untested ([#13](https://github.com/accensa/x402-facilitator-stellar/issues/13)).
 
-An unmodified `typescript/http/fetch` client received a `402` with terms, signed a payment
-authorization, retried, and this facilitator verified and settled it on-chain — paying the
-network fee itself, so `areFeesSponsored` is observed rather than merely advertised.
-
-| Transaction | Ledger | Settled |
-|---|---|---|
-| [`5f1bd15a…5558`](https://stellar.expert/explorer/testnet/tx/5f1bd15aec8ca3c6390689ed7fed82506f6c3d8eb8ed325a05a8b83974925558) | 4134781 | 08:15:33Z |
-| [`ff798145…0590`](https://stellar.expert/explorer/testnet/tx/ff798145681ad66e20f39f60d91895e993bc8033bbc78847aa5ddf0ee1e70590) | 4134928 | 08:27:49Z |
-
-Both report `"successful": true` from Horizon. Verify without trusting this file:
-
-```bash
-curl -s https://horizon-testnet.stellar.org/transactions/5f1bd15aec8ca3c6390689ed7fed82506f6c3d8eb8ed325a05a8b83974925558 \
-  | jq '{successful, ledger, created_at}'
-```
-
-### Four of five scenarios still fail
-
-`typescript/http/next` passes. `express`, `fastify`, `hono` and `mcp` do not — two with
-`Payment response header not found`, two with upstream's `402 facilitator_error`. This
-reproduced identically across two runs in which the harness ordered the combinations
-differently, so it is **structural rather than flaky**. Exactly one settlement occurs per
-run; the four failures never reach the chain.
-
-**It cannot currently be diagnosed**, because this facilitator emits four lines of output
-across an entire run — three startup banners and an exit code. Two of the failures mean
-*this service returned an error*, and there is no record of what it was. That makes
-[#7](https://github.com/accensa/x402-facilitator-stellar/issues/7) the blocking item
-rather than a nice-to-have; the investigation is
-[#64](https://github.com/accensa/x402-facilitator-stellar/issues/64).
-
-The full record, including the treasury prerequisite that had to be solved first and how
-to reproduce both results, is in [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md).
+The README is the summary; the report is the artifact. Trust the links, not this paragraph.
 
 Responses use the canonical field names — `VerifyResponse` carries `invalidReason` and
 `invalidMessage`; `SettleResponse` carries `errorReason`, `errorMessage`, `transaction`

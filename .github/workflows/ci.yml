@@ -121,3 +121,23 @@ jobs:
           node -e "import('./index.js').catch(e => { console.error(e); process.exit(1); })" &
           sleep 5
           kill %1
+
+  conformance-staleness:
+    name: conformance report not stale
+    runs-on: ubuntu-latest
+    steps:
+      # Full history is required: the check counts commits between the report's
+      # recorded anchor SHA and HEAD, and a default shallow checkout has no
+      # ancestry to count.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      # Fails when docs/CONFORMANCE.md's anchor SHA is more than N commits behind
+      # main and the report was not updated in those commits. A stale conformance
+      # report is worse than none — this keeps the README's link honest.
+      - run: node scripts/check-conformance-staleness.mjs
