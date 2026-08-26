@@ -26,10 +26,10 @@
 > [!WARNING]
 > **This is a conformance spike, not a production facilitator.** It exists to answer one
 > question: can an unmodified canonical x402 client complete a payment against a
-> facilitator we operate on Stellar testnet? **As of 2026-08-14 the answer is yes, twice,
-> with settled transactions anyone can verify** — and **four of the five upstream server
-> components still fail**. See [Conformance](#conformance) for both halves. It makes no
-> availability claim and is not deployed anywhere you can reach.
+> facilitator we operate on Stellar testnet? **As of 2026-08-26 the answer is yes across
+> all five upstream server components** — 10 of 10 scenarios in the upstream e2e suite,
+> with settled transactions anyone can verify. See [Conformance](#conformance). It makes
+> no availability claim and is not deployed anywhere you can reach.
 
 ## The Problem
 
@@ -103,6 +103,7 @@ file entirely: there, the environment comes from the orchestrator.
 cp .env.example .env   # then fill in FACILITATOR_SECRET
 npm start              # or: npm run dev (adds --watch)
 curl localhost:3402/healthz
+curl localhost:3402/readyz
 ```
 
 `FACILITATOR_SECRET` is a signing key. `.env` is gitignored — never commit it.
@@ -141,8 +142,9 @@ holds today on testnet:
       unregistered scheme/network pairs, and scheme-level failures
 - [x] The spec's `payload: {transaction}` shape is accepted verbatim
 - [x] **An unmodified canonical client completes a payment end-to-end**
-- [x] **Settled transaction hash published** — two, below
-- [ ] The x402 repository's e2e suite — **1 of 5 server components passes**
+- [x] **Settled transaction hash published** — see the conformance table below
+- [x] **The x402 repository's e2e suite — 5 of 5 server components pass** (10/10
+      scenarios across `express`, `fastify`, `hono`, `next`, `mcp`, 2026-08-25/26)
 - [ ] `stellar:pubnet`
 
 ### Settled on Stellar testnet, 2026-08-14
@@ -163,35 +165,33 @@ curl -s https://horizon-testnet.stellar.org/transactions/5f1bd15aec8ca3c6390689e
   | jq '{successful, ledger, created_at}'
 ```
 
-### Four of five scenarios still fail
+### The full matrix passes — 2026-08-25/26
 
-`typescript/http/next` passes. `express`, `fastify`, `hono` and `mcp` do not — two with
-`Payment response header not found`, two with upstream's `402 facilitator_error`. This
-reproduced identically across two runs in which the harness ordered the combinations
-differently, so it is **structural rather than flaky**. Exactly one settlement occurs per
-run; the four failures never reach the chain.
+The August 14 run was the first with a real USDC treasury: one payment settled and four
+scenarios failed — `express`, `fastify`, `hono` and `mcp` — with `Payment response header
+not found` or upstream's `402 facilitator_error`, and the facilitator's four lines of
+output made the failures undiagnosable. That was tracked in
+[#64](https://github.com/accensa/x402-facilitator-stellar/issues/64) and blocked on
+[#7](https://github.com/accensa/x402-facilitator-stellar/issues/7), request-scoped
+structured logging, request correlation and `/metrics`.
 
-**It cannot currently be diagnosed**, because this facilitator emits four lines of output
-across an entire run — three startup banners and an exit code. Two of the failures mean
-*this service returned an error*, and there is no record of what it was. That makes
-[#7](https://github.com/accensa/x402-facilitator-stellar/issues/7) the blocking item
-rather than a nice-to-have; the investigation is
-[#64](https://github.com/accensa/x402-facilitator-stellar/issues/64).
+Both are done. The daily upstream suite has passed **10 of 10 scenarios on two
+consecutive nights** (2026-08-25, 2026-08-26): all five server components (`express`,
+`fastify`, `hono`, `next`, `mcp`) × the plain and `upfront` payment flows, each with a
+settled transaction hash on testnet. The facilitator now logs one structured line per
+request with redacted headers — a verify/settle outcome and rejection reason on every
+call — plus an `audit` channel and `/metrics`, so a future failure is attributable to a
+specific request instead of a four-line mystery.
 
 The full record, including the treasury prerequisite that had to be solved first and how
-to reproduce both results, is in [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md).
+to reproduce the runs, is in [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md).
 
 Responses use the canonical field names — `VerifyResponse` carries `invalidReason` and
 `invalidMessage`; `SettleResponse` carries `errorReason`, `errorMessage`, `transaction`
-and `network`. There is no `reason` field, and inventing one produces a service that looks
-correct locally and is non-conformant on the wire.
+and `network`. The transport-layer HTTP rejections (such as 401 Unauthorized or 429 Too Many Requests) also conform to the `VerifyResponse` shape to ensure a client has one parser, not three. For an exhaustive taxonomy of all emitted reasons, see [REASONS.md](docs/REASONS.md).
 
 ## Known Gaps
 
-- **One signer.** `ExactStellarScheme` accepts an *array* of signers with a round-robin
-  `selectSigner`, plus an optional `feeBumpSigner` that decouples fee payment from
-  sequence-number management. That pair is how bursty agent traffic avoids sequence
-  contention. One signer is enough to prove conformance and not enough to serve load.
 - **Bazaar is built but unproven against a second implementation.** Discovery, search and
   automatic cataloging landed on 2026-08-12 and are documented in
   [`docs/BAZAAR.md`](docs/BAZAAR.md): a catalog datastore with migrations,
