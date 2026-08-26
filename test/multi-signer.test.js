@@ -1,0 +1,148 @@
+import { test, describe } from 'node:test';
+import assert from 'node:assert/strict';
+import { Keypair } from '@stellar/stellar-sdk';
+import { resolveConfig } from '../src/config.js';
+import { buildFacilitator } from '../src/facilitator.js';
+import { createApp } from '../src/app.js';
+import { createReadinessChecker } from '../src/readiness.js';
+import { signerMetrics } from '../src/metrics.js';
+
+describe('Multi-Signer Pool & Fee-Bump Signer (#9)', () => {
+  const k1 = Keypair.random();
+  const k2 = Keypair.random();
+  const k3 = Keypair.random();
+  const fb = Keypair.random();
+
+  test('resolveConfig parses multi-signer secrets and fee-bump secret', () => {
+    const config = resolveConfig({
+      FACILITATOR_SECRETS: `${k1.secret()},${k2.secret()}`,
+      FEE_BUMP_SECRET: fb.secret(),
+    });
+
+    assert.equal(config.perNetwork['stellar:testnet'].secrets.length, 2);
+    assert.equal(config.perNetwork['stellar:testnet'].secrets[0], k1.secret());
+    assert.equal(config.perNetwork['stellar:testnet'].secrets[1], k2.secret());
+    assert.equal(config.perNetwork['stellar:testnet'].feeBumpSecret, fb.secret());
+  });
+
+  test('resolveConfig falls back to FACILITATOR_SECRET for single signer', () => {
+    const config = resolveConfig({
+      FACILITATOR_SECRET: k1.secret(),
+    });
+
+    assert.equal(config.perNetwork['stellar:testnet'].secrets.length, 1);
+    assert.equal(config.perNetwork['stellar:testnet'].secrets[0], k1.secret());
+  });
+
+  test('resolveConfig rejects duplicate secret keys in pool', () => {
+    assert.throws(
+      () =>
+        resolveConfig({
+          FACILITATOR_SECRETS: `${k1.secret()},${k1.secret()}`,
+        }),
+      /Duplicate secret key found/,
+    );
+  });
+
+  test('resolveConfig rejects malformed secret keys', () => {
+    assert.throws(
+      () =>
+        resolveConfig({
+          FACILITATOR_SECRETS: 'invalidSecretKey',
+        }),
+      /must be a Stellar secret key/,
+    );
+  });
+
+  test('buildFacilitator exports all pool signers and configures scheme', () => {
+    const config = resolveConfig({
+      FACILITATOR_SECRETS: `${k1.secret()},${k2.secret()},${k3.secret()}`,
+      FEE_BUMP_SECRET: fb.secret(),
+    });
+
+    const { facilitator, signers, feeBumpSigners } = buildFacilitator(config);
+
+    assert.equal(signers['stellar:testnet'].length, 3);
+    assert.equal(signers['stellar:testnet'][0], k1.publicKey());
+    assert.equal(signers['stellar:testnet'][1], k2.publicKey());
+    assert.equal(signers['stellar:testnet'][2], k3.publicKey());
+    assert.equal(feeBumpSigners['stellar:testnet'], fb.publicKey());
+
+    const supported = facilitator.getSupported();
+    assert.ok(supported['stellar:testnet']);
+    assert.equal(supported['stellar:testnet'].signers.length, 3);
+    assert.equal(supported['stellar:testnet'].signers[0], k1.publicKey());
+    assert.equal(supported['stellar:testnet'].signers[1], k2.publicKey());
+    assert.equal(supported['stellar:testnet'].signers[2], k3.publicKey());
+  });
+
+  test('GET /supported reports all pool addresses over HTTP', async () => {
+    const config = resolveConfig({
+      FACILITATOR_SECRETS: `${k1.secret()},${k2.secret()}`,
+    });
+    const { facilitator } = buildFacilitator(config);
+    const app = createApp(config, facilitator, {}, {});
+
+    try {
+      const res = await app.inject({ method: 'GET', url: '/supported' });
+      assert.equal(res.statusCode, 200);
+      const body = JSON.parse(res.payload);
+      assert.equal(body['stellar:testnet'].signers.length, 2);
+      assert.equal(body['stellar:testnet'].signers[0], k1.publicKey());
+      assert.equal(body['stellar:testnet'].signers[1], k2.publicKey());
+    } finally {
+      await app.close();
+    }
+  });
+
+  test('readiness checker checks all signers in pool', async () => {
+    const config = resolveConfig({
+      FACILITATOR_SECRETS: `${k1.secret()},${k2.secret()}`,
+    });
+
+    const checkedAddresses = [];
+    const rpcStub = async (_url, body) => {
+      if (body.method === 'getHealth') return { result: { status: 'healthy' } };
+      if (body.method === 'getLedgerEntries') {
+        checkedAddresses.push(body.params.keys[0]);
+        return {
+          result: {
+            entries: [
+              {
+                val: 'AAAAAgAAAAA=', // Mock ledger entry
+              },
+            ],
+          },
+        };
+      }
+      return {};
+    };
+
+    const checker = createReadinessChecker(config, {
+      rpcCall: rpcStub,
+      cacheTtlMs: 0,
+    });
+
+    const report = await checker.check();
+    assert.equal(report.ok, true);
+    assert.equal(checkedAddresses.length, 2);
+  });
+
+  test('GET /metrics returns Prometheus format signer metrics', async () => {
+    signerMetrics.recordSelection('stellar:testnet', k1.publicKey());
+    signerMetrics.incrementInflight('stellar:testnet', k1.publicKey());
+
+    const config = resolveConfig({ FACILITATOR_SECRET: k1.secret() });
+    const app = createApp(config, { getSupported: () => ({}) }, {}, {});
+
+    try {
+      const res = await app.inject({ method: 'GET', url: '/metrics' });
+      assert.equal(res.statusCode, 200);
+      assert.match(res.payload, /x402_signer_selected_total/);
+      assert.match(res.payload, /x402_signer_inflight/);
+      assert.match(res.payload, new RegExp(k1.publicKey()));
+    } finally {
+      await app.close();
+    }
+  });
+});

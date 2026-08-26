@@ -42,6 +42,7 @@ import { validatePaymentBody } from './request-validation.js';
 import { requestLogger } from './logger.js';
 import { lockKeyFor } from './distributed-lock.js';
 import { requestState } from './request-state.js';
+import { signerMetrics } from './metrics.js';
 
 /** 256kb body cap, carried over unchanged from the Express transport. */
 const BODY_LIMIT_BYTES = 256 * 1024;
@@ -517,6 +518,11 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   }
 
   app.get('/healthz', async () => ({ ok: true }));
+
+  app.get('/metrics', async (_req, reply) => {
+    reply.header('content-type', 'text/plain; version=0.0.4; charset=utf-8');
+    return reply.send(signerMetrics.toPrometheusText());
+  });
 
   /**
    * GET /readyz — the readiness probe (#100, #8).
