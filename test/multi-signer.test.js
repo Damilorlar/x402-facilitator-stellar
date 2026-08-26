@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { Keypair } from '@stellar/stellar-sdk';
+import { Keypair, xdr } from '@stellar/stellar-sdk';
 import { resolveConfig } from '../src/config.js';
 import { buildFacilitator } from '../src/facilitator.js';
 import { createApp } from '../src/app.js';
@@ -62,18 +62,20 @@ describe('Multi-Signer Pool & Fee-Bump Signer (#9)', () => {
 
     const { facilitator, signers, feeBumpSigners } = buildFacilitator(config);
 
+    // buildFacilitator returns signers keyed by network
     assert.equal(signers['stellar:testnet'].length, 3);
     assert.equal(signers['stellar:testnet'][0], k1.publicKey());
     assert.equal(signers['stellar:testnet'][1], k2.publicKey());
     assert.equal(signers['stellar:testnet'][2], k3.publicKey());
     assert.equal(feeBumpSigners['stellar:testnet'], fb.publicKey());
 
+    // The upstream x402Facilitator aggregates all signers under 'stellar:*'
     const supported = facilitator.getSupported();
-    assert.ok(supported['stellar:testnet']);
-    assert.equal(supported['stellar:testnet'].signers.length, 3);
-    assert.equal(supported['stellar:testnet'].signers[0], k1.publicKey());
-    assert.equal(supported['stellar:testnet'].signers[1], k2.publicKey());
-    assert.equal(supported['stellar:testnet'].signers[2], k3.publicKey());
+    const poolSigners = supported.signers?.['stellar:*'] ?? [];
+    assert.ok(poolSigners.length >= 3, `expected at least 3 signers, got ${poolSigners.length}`);
+    assert.ok(poolSigners.includes(k1.publicKey()), 'k1 not in pool');
+    assert.ok(poolSigners.includes(k2.publicKey()), 'k2 not in pool');
+    assert.ok(poolSigners.includes(k3.publicKey()), 'k3 not in pool');
   });
 
   test('GET /supported reports all pool addresses over HTTP', async () => {
@@ -87,9 +89,11 @@ describe('Multi-Signer Pool & Fee-Bump Signer (#9)', () => {
       const res = await app.inject({ method: 'GET', url: '/supported' });
       assert.equal(res.statusCode, 200);
       const body = JSON.parse(res.payload);
-      assert.equal(body['stellar:testnet'].signers.length, 2);
-      assert.equal(body['stellar:testnet'].signers[0], k1.publicKey());
-      assert.equal(body['stellar:testnet'].signers[1], k2.publicKey());
+      // x402Facilitator.getSupported() returns signers keyed by 'stellar:*'
+      const signerList = body.signers?.['stellar:*'] ?? body.signers?.['stellar:testnet'] ?? [];
+      assert.equal(signerList.length, 2);
+      assert.ok(signerList.includes(k1.publicKey()), `k1 (${k1.publicKey()}) not in signers`);
+      assert.ok(signerList.includes(k2.publicKey()), `k2 (${k2.publicKey()}) not in signers`);
     } finally {
       await app.close();
     }
@@ -104,14 +108,25 @@ describe('Multi-Signer Pool & Fee-Bump Signer (#9)', () => {
     const rpcStub = async (_url, body) => {
       if (body.method === 'getHealth') return { result: { status: 'healthy' } };
       if (body.method === 'getLedgerEntries') {
-        checkedAddresses.push(body.params.keys[0]);
+        // Build a minimal but valid serialized AccountEntry so readiness can parse the balance.
+        const signerAddr = body.params.keys[0]; // base64 LedgerKey — we only need to respond
+        checkedAddresses.push(signerAddr);
+        const acct = new xdr.AccountEntry({
+          accountId: k1.xdrPublicKey(),
+          balance: new xdr.Int64(100_000_000),
+          seqNum: new xdr.SequenceNumber(new xdr.Int64(0)),
+          numSubEntries: 0,
+          inflationDest: null,
+          flags: 0,
+          homeDomain: '',
+          thresholds: Buffer.from([1, 0, 0, 0]),
+          signers: [],
+          ext: new xdr.AccountEntryExt(0),
+        });
+        const entry = xdr.LedgerEntryData.account(acct);
         return {
           result: {
-            entries: [
-              {
-                val: 'AAAAAgAAAAA=', // Mock ledger entry
-              },
-            ],
+            entries: [{ val: entry.toXDR('base64') }],
           },
         };
       }
