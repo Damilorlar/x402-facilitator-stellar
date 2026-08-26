@@ -69,7 +69,10 @@ function rpcStub({
       return { result: { status: healthy ? 'healthy' : 'degraded' } };
     }
     if (body.method === 'getLedgerEntries') {
-      return { result: { entries: entryVal ? [{ val: entryVal }] : [] } };
+      // Soroban RPC returns the entry's ledger data under `xdr` (shape:
+      // key/xdr/lastModifiedLedgerSeq/extXdr). The stub must mirror the real
+      // wire shape or the checker can pass tests while failing in production.
+      return { result: { entries: entryVal ? [{ xdr: entryVal }] : [] } };
     }
     throw new Error(`unexpected method ${body.method}`);
   };
@@ -129,7 +132,8 @@ describe('readiness checker', () => {
     const poorReport = await poor.check();
     const signer = poorReport.networks['stellar:testnet'].checks.signer_funded;
     assert.equal(signer.ok, false);
-    assert.equal(signer.balance_stroops, 500);
+    // Multi-signer: individual signer results are in signer.signers[]
+    assert.equal(signer.signers[0].balance_stroops, 500);
     assert.match(signer.error, /below floor 1000000/);
   });
 
@@ -181,9 +185,23 @@ describe('readiness checker', () => {
     assert.equal(report.catalog.ok, false);
     assert.match(report.catalog.error, /corrupted/);
   });
+
+  test('setShuttingDown flips check to ok: false and status: shutting_down', async () => {
+    const config = configWith([['stellar:testnet', 'http://rpc.test']]);
+    const checker = createReadinessChecker(config, {
+      rpcCall: rpcStub(),
+      cacheTtlMs: 0,
+    });
+    let report = await checker.check();
+    assert.equal(report.ok, true);
+    checker.setShuttingDown();
+    report = await checker.check();
+    assert.equal(report.ok, false);
+    assert.equal(report.status, 'shutting_down');
+  });
 });
 
-describe('GET /health/ready over HTTP', () => {
+describe('GET /readyz over HTTP', () => {
   test('503 with a body naming the failing dependency and network', async () => {
     const app = await serve({
       extras: {
@@ -204,7 +222,7 @@ describe('GET /health/ready over HTTP', () => {
       },
     });
     try {
-      const res = await app.get('/health/ready');
+      const res = await app.get('/readyz');
       assert.equal(res.status, 503);
       const body = await res.json();
       assert.equal(body.ok, false);
@@ -226,7 +244,7 @@ describe('GET /health/ready over HTTP', () => {
       },
     });
     try {
-      const res = await app.get('/health/ready');
+      const res = await app.get('/readyz');
       assert.equal(res.status, 200);
       assert.equal((await res.json()).status, 'ready');
     } finally {
