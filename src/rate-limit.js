@@ -147,7 +147,7 @@ export class RateLimiter {
     await this._increment(ownerId, 'settle', 60, 1);
     await this._increment(ownerId, 'settle', 3600, 1);
     await this._increment(ownerId, 'settle', 86400, 1);
-    if (feeCharged) {
+    if (feeCharged > 0) {
       await this._increment(ownerId, 'fee', 86400, feeCharged);
     }
   }
