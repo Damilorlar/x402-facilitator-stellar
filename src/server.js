@@ -73,15 +73,18 @@ if (config.rateLimitStore === 'crdt' && config.databaseUrl) {
     databaseUrl: config.databaseUrl,
     maxSize: 10000,
   });
-  rateLimiter = new RateLimiter(config, crdtStore);
+  // RateLimiter expects the { global, keys, perNetwork } limits shape, which
+  // lives at config.rateLimits — passing the whole config would leave
+  // `global` undefined and crash every rate-limited route.
+  rateLimiter = new RateLimiter(config.rateLimits, crdtStore);
 } else if (config.redisUrl) {
-  rateLimiter = new RedisRateLimiter(config, { redisUrl: config.redisUrl });
+  rateLimiter = new RedisRateLimiter(config.rateLimits, { redisUrl: config.redisUrl });
 } else {
   rateLimitStore = createRateLimitStore(process.env, 10000);
   rateLimitStore.ready?.catch(err => {
     console.error(`[RateLimit] shared store failed to initialise: ${err.message}`);
   });
-  rateLimiter = new RateLimiter(config, rateLimitStore);
+  rateLimiter = new RateLimiter(config.rateLimits, rateLimitStore);
 }
 const catalog = new MemoryCatalogStore(config);
 const idempotency = buildIdempotencyStore(config);
@@ -112,9 +115,28 @@ const failoverHealth = config.region
   : null;
 import { buildSettlementStore } from './store/index.js';
 import { startReconciliationLoop } from './store/reconciliation.js';
+import { startOutboxWorker } from './outbox/index.js';
 
 const settlementStore = buildSettlementStore(config);
 const reconciliation = startReconciliationLoop(settlementStore, config);
+
+// Transactional outbox (#123): the settle path writes the notification in the
+// same transaction as the 'settled' state change (see app.js); this worker
+// polls those rows and publishes them through the webhook dispatcher. It runs
+// only when there is something durable to poll (Postgres) and something to
+// publish to; otherwise the app falls back to the fire-and-forget webhook
+// path, which is the pre-outbox behaviour.
+const outbox = settlementStore.outbox ?? null;
+const outboxWorker =
+  outbox && typeof webhooks.publish === 'function'
+    ? startOutboxWorker({
+        outbox,
+        publish: record => webhooks.publish(record),
+        intervalMs: config.outboxPollIntervalMs,
+        log: msg => console.warn(msg),
+      })
+    : null;
+outboxWorker?.start();
 
 const app = createApp(config, facilitator, rateLimiter, catalog, idempotency, {
   breakerStates: rpc?.getBreakerStates,
@@ -196,10 +218,12 @@ async function shutdown(signal) {
   const shutdownPromise = (async () => {
     try {
       reconciliation?.stop();
+      await outboxWorker?.stop();
       await app.close();
       await webhooks.stop().catch(() => {});
-      await distributedLock?.quit().catch(() => {});
+      await distributedLock?.quit()?.catch(() => {});
       await crdtStore?.close().catch(() => {});
+      failoverHealth?.stop();
       await rateLimiter?.close?.().catch(() => {});
       horizon.restore();
     } catch (err) {
