@@ -718,11 +718,12 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       attachValidation: true,
     },
     async (req, reply) => {
-      const check = await rateLimiter.checkSettle(req);
-      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
-
       const body = readPaymentBody(req, reply, 'settle');
       if (!body) return reply;
+
+      const network = body.paymentRequirements.network;
+      const check = await rateLimiter.checkSettle(req, network);
+      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
 
       const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
       const existingRecord = await settlementStore.get(idempotencyKey);
