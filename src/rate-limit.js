@@ -36,7 +36,9 @@ export class RateLimiter {
   }
 
   _getKeyConfig(keyId) {
-    return this.config.keys[keyId] || this.config.global;
+    // Normalize key id to uppercase for case-insensitive lookup
+    const normalizedKeyId = keyId ? keyId.toUpperCase() : keyId;
+    return this.config.keys[normalizedKeyId] || this.config.global;
   }
 
   _getBucketId(ownerId, type, windowSec) {
