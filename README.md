@@ -227,3 +227,4 @@ a conformance failure: point a canonical client at it and report what breaks.
 
 Apache-2.0 — see [LICENSE](LICENSE). Chosen to match upstream `@x402/*` so work here can
 be contributed back.
+// fix
