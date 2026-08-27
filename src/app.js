@@ -38,7 +38,7 @@ import Fastify from 'fastify';
 import { validateForCatalog } from './catalog/validation.js';
 import { createAuditLogger } from './audit.js';
 import { createReadinessChecker } from './readiness.js';
-import { validatePaymentBody } from './request-validation.js';
+import { validatePaymentBody, validatePaymentFields } from './request-validation.js';
 import { requestLogger } from './logger.js';
 import { lockKeyFor } from './distributed-lock.js';
 import { requestState } from './request-state.js';
@@ -96,12 +96,14 @@ const PAYMENT_BODY_SCHEMA = {
  *   - audit: audit writer override (default createAuditLogger)
  *   - readiness: readiness checker override
  *   - breakerStates: breaker-state reader for the readiness probe (#105)
+ *   - failoverHealth (#126): region-aware failover health checker
  * @returns {import('fastify').FastifyInstance}
  */
 export function createApp(config, facilitator, rateLimiter, catalog, idempotency, extras = {}) {
-  const {
-    distributedLock = null,
-    webhooks = null,
+  const { 
+    distributedLock = null, 
+    webhooks = null, 
+    failoverHealth = null,
     settlementStore = extras.settlementStore ?? buildSettlementStore(config),
   } = extras;
   const app = Fastify({
@@ -308,6 +310,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * is logged, never surfaced as a payment failure.
    */
   async function processCataloging(req, body, reply, source = 'payment') {
+    try {
     const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
     const outcome = {};
 
@@ -378,6 +381,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       'EXTENSION-RESPONSES',
       Buffer.from(JSON.stringify({ bazaar: outcome })).toString('base64'),
     );
+    } catch (err) {
+      console.error('[Catalog] Unhandled error during processCataloging:', err);
+    }
   }
 
   /**
@@ -424,7 +430,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         presentedHash.length === apiKey.hash.length &&
         crypto.timingSafeEqual(presentedHash, apiKey.hash)
       ) {
-        req.keyId = apiKey.id;
+        req.keyId = apiKey.id.toUpperCase();
         return;
       }
     }
@@ -534,6 +540,36 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     };
   }
 
+  function readDiscoveryBody(req, reply) {
+    let result;
+    if (req.validationError) {
+      const detail = Array.isArray(req.validationError.validation)
+        ? req.validationError.validation[0]
+        : undefined;
+      result = {
+        valid: false,
+        reason: 'invalid_request',
+        message: detail?.message
+          ? `${detail.instancePath ?? detail.params?.missingProperty ?? 'body'} ${detail.message}`.trim()
+          : (req.validationError.message ?? 'invalid request body'),
+      };
+    } else {
+      result = validatePaymentFields(req.body);
+    }
+
+    if (!result.valid) {
+      reply.code(400).send({
+        error: 'invalid_resource',
+        reason: result.reason,
+      });
+      return null;
+    }
+    return {
+      paymentPayload: result.paymentPayload,
+      paymentRequirements: result.paymentRequirements,
+    };
+  }
+
   app.get('/healthz', async () => ({ ok: true }));
 
   app.get('/metrics', async (_req, reply) => {
@@ -551,14 +587,21 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    */
   app.get('/readyz', async (_req, reply) => {
     if (!readiness) {
-      return reply.code(503).send({
+      const response = {
         ok: false,
         status: 'not_ready',
         reason: 'readiness_not_configured',
-      });
+      };
+      if (failoverHealth) {
+        response.failover = failoverHealth.getState();
+      }
+      return reply.code(503).send(response);
     }
     try {
       const report = await readiness.check();
+      if (failoverHealth) {
+        report.failover = failoverHealth.getState();
+      }
       return reply.code(report.ok ? 200 : 503).send(report);
     } catch (err) {
       return reply.code(503).send({ ok: false, status: 'not_ready', error: err.message });
@@ -634,11 +677,21 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         //
         // An open RPC breaker gets its own code so a caller can tell "the chain
         // is unreachable" from "your payment was rejected" (#105, #6).
+        const network = body?.paymentRequirements?.network ?? 'unknown';
+        const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
+        console.error(
+          `[/verify] Exception: route=/verify network=${network} scheme=${scheme} ` +
+          `error=${err instanceof Error ? err.message : String(err)} ` +
+          `stack=${err instanceof Error ? err.stack : 'no stack'}`
+        );
+        
         let invalidReason = 'facilitator_error';
         if (err?.code === 'REQUEST_TIMEOUT') {
           invalidReason = 'request_timeout';
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           invalidReason = 'soroban_rpc_unreachable';
+        } else if (err?.message?.includes('unregistered') || err?.message?.includes('scheme')) {
+          invalidReason = 'unsupported_scheme_network';
         }
         if (invalidReason !== 'facilitator_error') {
           audit('rpc_unreachable', {
@@ -665,11 +718,12 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       attachValidation: true,
     },
     async (req, reply) => {
-      const check = await rateLimiter.checkSettle(req);
-      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
-
       const body = readPaymentBody(req, reply, 'settle');
       if (!body) return reply;
+
+      const network = body.paymentRequirements.network;
+      const check = await rateLimiter.checkSettle(req, network);
+      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
 
       const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
       const existingRecord = await settlementStore.get(idempotencyKey);
@@ -769,10 +823,10 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       try {
         const settleOnce = async () => {
           const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
-          await rateLimiter.recordSettle(
-            req,
-            result.success ? result.transactionFeeStroops || 0 : 0,
-          );
+          const network = body.paymentRequirements.network;
+          const maxFee = config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000;
+          const feeCharged = result.success ? maxFee : 0;
+          await rateLimiter.recordSettle(req, feeCharged);
           handleRateLimit(reply, check);
           if (result.success) {
             await settlementStore.updateState(idempotencyKey, 'settled', {
@@ -851,6 +905,14 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         // A lock that never freed under healthy Redis gets its own code (#116),
         // and an open RPC breaker gets its own code so a caller can tell "the
         // chain is unreachable" from "your payment was rejected" (#105, #6).
+        const network = body?.paymentRequirements?.network ?? 'unknown';
+        const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
+        console.error(
+          `[/settle] Exception: route=/settle network=${network} scheme=${scheme} ` +
+          `error=${err instanceof Error ? err.message : String(err)} ` +
+          `stack=${err instanceof Error ? err.stack : 'no stack'}`
+        );
+        
         let errorReason = 'facilitator_error';
         if (err?.code === 'SUBMITTED_OUTCOME_UNKNOWN') {
           errorReason = 'submitted_outcome_unknown';
@@ -861,6 +923,8 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           errorReason = 'soroban_rpc_unreachable';
           audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'settle' });
+        } else if (err?.message?.includes('unregistered') || err?.message?.includes('scheme')) {
+          errorReason = 'unsupported_scheme_network';
         }
 
         let transaction = '';
@@ -915,6 +979,34 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   );
 
   /**
+   * GET /settlements/:idempotencyKey/events — full, ordered event history for
+   * one settlement (#130). The projection above answers "what is the current
+   * state"; this answers "how did it get there" — the record a regulatory
+   * audit needs. Scoped identically to the settlement it belongs to.
+   */
+  app.get(
+    '/settlements/:idempotencyKey/events',
+    {
+      onRequest: cors('authenticated'),
+      preHandler: requireApiKey,
+    },
+    async (req, reply) => {
+      const { idempotencyKey } = req.params;
+      const record = await settlementStore.get(idempotencyKey);
+      if (!record) {
+        return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
+      }
+
+      if (req.keyId && record.key_id && record.key_id !== req.keyId) {
+        return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
+      }
+
+      const events = await settlementStore.getEventLog(idempotencyKey);
+      return reply.send({ ok: true, idempotencyKey, events });
+    },
+  );
+
+  /**
    * Manual registration, the secondary path.
    *
    * Automatic cataloging off the payment path is the primary one — anything
@@ -929,7 +1021,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       attachValidation: true,
     },
     async (req, reply) => {
-      const body = readPaymentBody(req, reply);
+      const body = readDiscoveryBody(req, reply);
       if (!body) return reply;
 
       const check = await rateLimiter.checkCatalog(req);
