@@ -48,6 +48,23 @@ const rpc = installRpcRetry({
 
 const config = resolveConfig();
 
+// Vault-managed database pool (#127): when VAULT_ADDR is set, Postgres
+// credentials come from Vault's database secrets engine (AppRole login, lease
+// rotation) instead of a long-lived password in DATABASE_URL, which then
+// carries host/port/database only. The one pool is shared by every
+// database-backed store. If Vault is unreachable at boot there is no cached
+// lease yet, so this is null and each store falls back to its degrade path.
+// Must be created before any store below that may use it.
+const vaultDatabase =
+  config.vault && config.databaseUrl
+    ? await createVaultManagedDatabase({
+        vault: config.vault,
+        databaseUrl: config.databaseUrl,
+        warn: msg => console.warn(msg),
+        log: msg => console.log(msg),
+      })
+    : null;
+
 // Issue #94: limiter state lives behind a store interface. RATE_LIMIT_STORE is
 // unset by default -> in-memory Map, exactly the pre-#94 behaviour. Set it to
 // 'postgres' (with DATABASE_URL) to share counters across replicas and keep the
@@ -80,14 +97,17 @@ if (config.rateLimitStore === 'crdt' && config.databaseUrl) {
 } else if (config.redisUrl) {
   rateLimiter = new RedisRateLimiter(config.rateLimits, { redisUrl: config.redisUrl });
 } else {
-  rateLimitStore = createRateLimitStore(process.env, 10000);
+  rateLimitStore = createRateLimitStore(process.env, {
+    maxSize: 10000,
+    pool: vaultDatabase?.pool,
+  });
   rateLimitStore.ready?.catch(err => {
     console.error(`[RateLimit] shared store failed to initialise: ${err.message}`);
   });
   rateLimiter = new RateLimiter(config.rateLimits, rateLimitStore);
 }
 const catalog = new MemoryCatalogStore(config);
-const idempotency = buildIdempotencyStore(config);
+const idempotency = buildIdempotencyStore(config, { pool: vaultDatabase?.pool });
 
 // Cross-process serialization for state transitions (#116). Absent config
 // means single-instance in-process locking.
@@ -116,8 +136,8 @@ const failoverHealth = config.region
 import { buildSettlementStore } from './store/index.js';
 import { startReconciliationLoop } from './store/reconciliation.js';
 import { startOutboxWorker } from './outbox/index.js';
-
-const settlementStore = buildSettlementStore(config);
+import { createVaultManagedDatabase } from './vault/index.js';
+const settlementStore = buildSettlementStore(config, { pool: vaultDatabase?.pool });
 const reconciliation = startReconciliationLoop(settlementStore, config);
 
 // Transactional outbox (#123): the settle path writes the notification in the
@@ -219,6 +239,7 @@ async function shutdown(signal) {
     try {
       reconciliation?.stop();
       await outboxWorker?.stop();
+      await vaultDatabase?.stop();
       await app.close();
       await webhooks.stop().catch(() => {});
       await distributedLock?.quit()?.catch(() => {});
