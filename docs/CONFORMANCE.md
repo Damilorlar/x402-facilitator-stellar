@@ -538,4 +538,3 @@ not; the re-assessment at the horizon is part of the commitment, not a loophole.
   automation and policy.
 - `docs/UPSTREAM.md` — the reviewed-baseline SHA and the full review policy (created
   by the drift-monitoring implementation).
- main

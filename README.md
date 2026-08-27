@@ -211,7 +211,6 @@ specific request instead of a four-line mystery.
 
 The full record, including the treasury prerequisite that had to be solved first and how
 to reproduce the runs, is in [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md).
- main
 
 Responses use the canonical field names — `VerifyResponse` carries `invalidReason` and
 `invalidMessage`; `SettleResponse` carries `errorReason`, `errorMessage`, `transaction`
