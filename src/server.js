@@ -124,7 +124,6 @@ const app = createApp(config, facilitator, rateLimiter, catalog, idempotency, {
   breakerStates: rpc?.getBreakerStates,
   distributedLock,
   webhooks,
- feat/observability
   logger: createRequestLog({ level: config.logLevel }),
   metrics,
   signers,
@@ -134,7 +133,6 @@ const app = createApp(config, facilitator, rateLimiter, catalog, idempotency, {
 
   failoverHealth,
   settlementStore,
- main
 });
 
 // Set by the METRICS_PORT branch below; closed on shutdown when present.
@@ -225,15 +223,6 @@ app.listen({ port: config.port, host: '0.0.0.0' }, () => {
  */
 async function shutdown(signal) {
   console.log(`${signal} received — draining`);
-  try {
-    await app.close();
-    await webhooks.stop().catch(() => {});
-    await distributedLock?.quit().catch(() => {});
-    await crdtStore?.close().catch(() => {});
-    failoverHealth?.stop();
-    horizon.restore();
-  } finally {
-    process.exit(0);
   if (app.readiness && typeof app.readiness.setShuttingDown === 'function') {
     app.readiness.setShuttingDown();
   }
@@ -248,6 +237,8 @@ async function shutdown(signal) {
       await new Promise(resolve => (metricsServerRef ? metricsServerRef.close(resolve) : resolve()));
       await webhooks.stop().catch(() => {});
       await distributedLock?.quit().catch(() => {});
+      await crdtStore?.close().catch(() => {});
+      failoverHealth?.stop();
       horizon.restore();
     } catch (err) {
       console.error(`Error during shutdown: ${err.message}`);

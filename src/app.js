@@ -101,8 +101,7 @@ const PAYMENT_BODY_SCHEMA = {
  * @returns {import('fastify').FastifyInstance}
  */
 export function createApp(config, facilitator, rateLimiter, catalog, idempotency, extras = {}) {
- feat/observability
-  const { distributedLock = null, webhooks = null } = extras;
+  const { distributedLock = null, webhooks = null, failoverHealth = null } = extras;
 
   // Observability collaborators. Both are injectable so tests can capture the
   // structured log line and inspect the metrics registry without a stdout scraper
@@ -123,14 +122,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   // set, server.js runs a separate listener for it and passes serveMetrics:false.
   const serveMetrics = extras.serveMetrics !== false;
 
-
-  const { distributedLock = null, webhooks = null, failoverHealth = null } = extras;
   const {
-    distributedLock = null,
-    webhooks = null,
     settlementStore = extras.settlementStore ?? buildSettlementStore(config),
   } = extras;
- main
   const app = Fastify({
     // Client IP resolution. Unset leaves Fastify's default (off), correct where
     // the port is published directly — local development and docker-compose.
@@ -894,15 +888,13 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
 
       try {
         const settleOnce = async () => {
- feat/observability
           // Sequence-contention signal (#9): this signer is now mid-settlement.
           if (signer) metrics.setSignerInflight({ network, signer, value: 1 });
           try {
             const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
-            await rateLimiter.recordSettle(
-              req,
-              result.success ? result.transactionFeeStroops || 0 : 0,
-            );
+            const maxFee = config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000;
+            const feeCharged = result.success ? maxFee : 0;
+            await rateLimiter.recordSettle(req, feeCharged);
             if (req.span) {
               req.span.settleOutcome = result.success ? 'settled' : 'failed';
               req.span.outcome = result.success ? 'ok' : 'rejected';
@@ -910,10 +902,15 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
                 ? 'none'
                 : (result.errorReason ?? 'settlement_failed');
               req.span.txHash = result.transaction || null;
-              req.span.feeStroops = result.success ? result.transactionFeeStroops || 0 : 0;
+              req.span.feeStroops = feeCharged;
             }
             handleRateLimit(reply, check);
             if (result.success) {
+              await settlementStore.updateState(idempotencyKey, 'settled', {
+                tx_hash: result.transaction,
+                response: result,
+              });
+
               await processCataloging(req, body, reply, 'payment');
 
               // Webhook notification (#117): published, not delivered inline.
@@ -930,51 +927,17 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
                   asset: body.paymentRequirements.asset,
                 });
               }
+            } else {
+              await settlementStore.updateState(idempotencyKey, 'failed', {
+                tx_hash: result.transaction || null,
+                error_reason: result.errorReason || 'facilitator_error',
+                error_message: result.errorMessage || null,
+                response: result,
+              });
             }
             if (idempotency && replay) {
               await idempotency.complete(replay.key, 200, result);
             }
-
-          const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
-          const network = body.paymentRequirements.network;
-          const maxFee = config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000;
-          const feeCharged = result.success ? maxFee : 0;
-          await rateLimiter.recordSettle(req, feeCharged);
-          handleRateLimit(reply, check);
-          if (result.success) {
-            await settlementStore.updateState(idempotencyKey, 'settled', {
-              tx_hash: result.transaction,
-              response: result,
-            });
-
-            await processCataloging(req, body, reply, 'payment');
-
-            // Webhook notification (#117): published, not delivered inline.
-            // A slow receiving server must never sit inside this HTTP
-            // request's lifecycle — see src/webhooks/.
-            if (webhooks && typeof webhooks.enqueue === 'function') {
-              webhooks.enqueue({
-                type: 'settlement.completed',
-                transaction: result.transaction,
-                network: result.network,
-                payer: result.payer,
-                payTo: body.paymentRequirements.payTo,
-                amount: body.paymentRequirements.maxAmountRequired,
-                asset: body.paymentRequirements.asset,
-              });
-            }
-          } else {
-            await settlementStore.updateState(idempotencyKey, 'failed', {
-              tx_hash: result.transaction || null,
-              error_reason: result.errorReason || 'facilitator_error',
-              error_message: result.errorMessage || null,
-              response: result,
-            });
-          }
-          if (idempotency && replay) {
-            await idempotency.complete(replay.key, 200, result);
-          }
- main
 
             // Settlements are THE auditable record: which authenticated caller moved
             // money, and the transaction hash to reconstruct it by.
@@ -983,7 +946,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
               outcome: result.success ? 'settled' : 'failed',
               transaction: result.transaction || null,
               network: result.network ?? body.paymentRequirements.network,
-              fee_stroops: result.success ? result.transactionFeeStroops || 0 : 0,
+              fee_stroops: feeCharged,
               error_reason: result.errorReason ?? null,
             });
             return result;
@@ -1046,16 +1009,12 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         ) {
           transaction = body.paymentPayload.transaction;
         }
- feat/observability
-
-
         const targetState = errorReason === 'submitted_outcome_unknown' ? 'unknown' : 'failed';
         await settlementStore.updateState(idempotencyKey, targetState, {
           tx_hash: transaction,
           error_reason: errorReason,
           error_message: err instanceof Error ? err.message : String(err),
         });
- main
         return reply.send({
           success: false,
           errorReason,

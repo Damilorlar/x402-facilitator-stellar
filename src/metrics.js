@@ -1,5 +1,4 @@
 /**
- feat/observability
  * In-process Prometheus metrics for the facilitator.
  *
  * Hand-rolled rather than pulling in `prom-client`: the surface is six series
@@ -192,6 +191,7 @@ export function createMetrics() {
   };
 }
 
+/**
  * Signer metrics for monitoring sequence contention and inflight operations (#9).
  */
 
@@ -270,4 +270,3 @@ class SignerMetrics {
 }
 
 export const signerMetrics = new SignerMetrics();
- main

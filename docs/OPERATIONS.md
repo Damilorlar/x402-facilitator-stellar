@@ -105,7 +105,6 @@ Example Response:
 
 If `FACILITATOR_API_KEYS` is omitted, the service runs in open mode. In this mode, limits from `RATE_LIMIT_GLOBAL` are enforced per source IP address rather than per API key. This prevents a single abusive client from draining a testnet faucet while still keeping onboarding frictionless.
 
- feat/observability
 ## Observability
 
 The transport emits **one structured JSON line per request** to stdout (one object per line, no framework). The shape is fixed and whitelisted — it never contains the auth entry, the raw `payload.transaction`, API keys, or the facilitator secret:
@@ -286,4 +285,3 @@ failed deploy, verify the old image's schema compatibility before restarting it 
 
 The same runbook, framed for the operator persona with the diagnosis steps spelled out,
 is in [`docs/OPERATOR.md`](./OPERATOR.md) § 7.
- main
