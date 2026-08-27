@@ -1,3 +1,4 @@
+/* global setInterval, clearInterval */
 /**
  * Sliding-window (fixed-window) rate limiter and usage meter.
  *
@@ -156,7 +157,9 @@ export class RateLimiter {
 
     // Check fee limit with maxTransactionFeeStroops reservation
     // Use the network's max fee to conservatively reserve the worst-case cost
-    const maxFee = network ? (this.config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000) : 50000;
+    const maxFee = network
+      ? (this.config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000)
+      : 50000;
     const feeCheck = await this._check(ownerId, 'fee', 86400, limits.feeSpd, maxFee);
     if (!feeCheck.allowed) {
       return { ...feeCheck, reason: feeCheck.reason || 'fee_ceiling_exceeded' };

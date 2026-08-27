@@ -120,7 +120,7 @@ export class RedisRateLimiter extends RateLimiter {
     await this._incrementAsync(ownerId, 'verify', 60, 1);
   }
 
-  async checkSettle(req, network = null) {
+  async checkSettle(req, _network = null) {
     const ownerId = req.keyId || req.ip;
     const limits = this._getKeyConfig(req.keyId);
     const checks = [
