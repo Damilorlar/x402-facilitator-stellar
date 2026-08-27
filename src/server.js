@@ -71,16 +71,17 @@ if (config.rateLimitStore === 'crdt' && config.databaseUrl) {
   crdtStore = new CrdtRateLimitStore({
     region: config.region || 'default',
     databaseUrl: config.databaseUrl,
+    maxSize: 10000,
   });
-  rateLimiter = new RateLimiter(config.rateLimits, crdtStore);
+  rateLimiter = new RateLimiter(config, crdtStore);
 } else if (config.redisUrl) {
-  rateLimiter = new RedisRateLimiter(config.rateLimits, { redisUrl: config.redisUrl });
+  rateLimiter = new RedisRateLimiter(config, { redisUrl: config.redisUrl });
 } else {
-  rateLimitStore = createRateLimitStore();
+  rateLimitStore = createRateLimitStore(process.env, 10000);
   rateLimitStore.ready?.catch(err => {
     console.error(`[RateLimit] shared store failed to initialise: ${err.message}`);
   });
-  rateLimiter = new RateLimiter(config.rateLimits, rateLimitStore);
+  rateLimiter = new RateLimiter(config, rateLimitStore);
 }
 const catalog = new MemoryCatalogStore(config);
 const idempotency = buildIdempotencyStore(config);
@@ -185,15 +186,6 @@ app.listen({ port: config.port, host: '0.0.0.0' }, () => {
  */
 async function shutdown(signal) {
   console.log(`${signal} received — draining`);
-  try {
-    await app.close();
-    await webhooks.stop().catch(() => {});
-    await distributedLock?.quit().catch(() => {});
-    await crdtStore?.close().catch(() => {});
-    failoverHealth?.stop();
-    horizon.restore();
-  } finally {
-    process.exit(0);
   if (app.readiness && typeof app.readiness.setShuttingDown === 'function') {
     app.readiness.setShuttingDown();
   }
@@ -207,6 +199,8 @@ async function shutdown(signal) {
       await app.close();
       await webhooks.stop().catch(() => {});
       await distributedLock?.quit().catch(() => {});
+      await crdtStore?.close().catch(() => {});
+      await rateLimiter?.close?.().catch(() => {});
       horizon.restore();
     } catch (err) {
       console.error(`Error during shutdown: ${err.message}`);

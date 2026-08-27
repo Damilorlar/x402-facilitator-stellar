@@ -25,7 +25,7 @@ import { MemoryStore } from './rate-limit-store.js';
 
 export class RateLimiter {
   /**
-   * @param {object} config - { global: {...}, keys: {...} } limits
+   * @param {object} config - { global: {...}, keys: {...}, perNetwork: {...} } limits
    * @param {{get: Function, increment: Function, sweep: Function}} [store]
    *   Defaults to in-process memory. Pass a shared store to enforce combined
    *   limits across replicas; two limiters pointed at one store behave as one.
@@ -33,6 +33,25 @@ export class RateLimiter {
   constructor(config, store = new MemoryStore()) {
     this.config = config;
     this.store = store;
+    this._sweepInterval = null;
+    this._startSweepInterval();
+  }
+
+  _startSweepInterval() {
+    // Deterministic sweep every 60 seconds instead of probabilistic 5% coin flip
+    this._sweepInterval = setInterval(() => {
+      const now = Math.floor(Date.now() / 1000);
+      this._sweep(now).catch(err => {
+        console.error(`[RateLimit] scheduled sweep failed: ${err.message}`);
+      });
+    }, 60000).unref(); // unref() allows process to exit if this is the only timer
+  }
+
+  close() {
+    if (this._sweepInterval) {
+      clearInterval(this._sweepInterval);
+      this._sweepInterval = null;
+    }
   }
 
   _getKeyConfig(keyId) {
@@ -47,15 +66,18 @@ export class RateLimiter {
     return `${ownerId}:${type}:${windowStart}:${windowSec}`;
   }
 
+  _computeResetAt(now, windowSec) {
+    const windowStart = now - (now % windowSec);
+    return windowStart + windowSec;
+  }
+
   async _increment(ownerId, type, windowSec, amount = 1) {
     const now = Math.floor(Date.now() / 1000);
     const bucketId = this._getBucketId(ownerId, type, windowSec);
-    const resetAt = now - (now % windowSec) + windowSec;
+    const resetAt = this._computeResetAt(now, windowSec);
 
     try {
       const bucket = await this.store.increment(bucketId, amount, resetAt, now);
-      // cleanup old buckets periodically
-      if (Math.random() < 0.05) await this._sweep(now);
       return bucket;
     } catch (err) {
       console.error(`[RateLimit] store increment failed (${err.message}) — count not recorded`);
@@ -74,16 +96,18 @@ export class RateLimiter {
     let bucket;
     try {
       bucket = await this.store.get(bucketId, now);
+      // Sweep on read as well as write to handle rejection-only traffic
+      await this._sweep(now);
     } catch {
       return {
         allowed: false,
         limit,
         remaining: 0,
-        resetAt: now + windowSec,
+        resetAt: this._computeResetAt(now, windowSec),
         reason: 'rate_limit_store_unavailable',
       };
     }
-    const resetAt = bucket?.resetAt ?? now - (now % windowSec) + windowSec;
+    const resetAt = bucket?.resetAt ?? this._computeResetAt(now, windowSec);
     const count = bucket?.count ?? 0;
     if (count + amount > limit) {
       return { allowed: false, limit, remaining: 0, resetAt };
@@ -115,7 +139,7 @@ export class RateLimiter {
     await this._increment(ownerId, 'verify', 60, 1);
   }
 
-  async checkSettle(req) {
+  async checkSettle(req, network = null) {
     const ownerId = req.keyId || req.ip;
     const limits = this._getKeyConfig(req.keyId);
 
@@ -130,10 +154,10 @@ export class RateLimiter {
       if (!c.allowed) return { ...c, reason: c.reason || 'rate_limit_exceeded' };
     }
 
-    // Check fee limit
-    // We can't strictly check fee before settlement unless we assume maxTransactionFeeStroops.
-    // We will check if the current consumed + 0 is > limits.feeSpd (or maxTransactionFeeStroops).
-    const feeCheck = await this._check(ownerId, 'fee', 86400, limits.feeSpd, 0); // just checking current
+    // Check fee limit with maxTransactionFeeStroops reservation
+    // Use the network's max fee to conservatively reserve the worst-case cost
+    const maxFee = network ? (this.config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000) : 50000;
+    const feeCheck = await this._check(ownerId, 'fee', 86400, limits.feeSpd, maxFee);
     if (!feeCheck.allowed) {
       return { ...feeCheck, reason: feeCheck.reason || 'fee_ceiling_exceeded' };
     }
@@ -176,6 +200,7 @@ export class RateLimiter {
 
   async getUsage(keyId) {
     const ownerId = keyId; // IP usage is not exposed via GET /usage, only key usage
+    const limits = this._getKeyConfig(keyId);
     const getCount = async (type, windowSec, fallback) => {
       const now = Math.floor(Date.now() / 1000);
       try {
@@ -193,6 +218,15 @@ export class RateLimiter {
       settle_rph: await getCount('settle', 3600),
       settle_rpd: await getCount('settle', 86400),
       fee_spd: await getCount('fee', 86400),
+      catalog_rpm: await getCount('catalog', 60),
+      limits: {
+        verify_rpm: limits.verifyRpm,
+        settle_rpm: limits.settleRpm,
+        settle_rph: limits.settleRph,
+        settle_rpd: limits.settleRpd,
+        fee_spd: limits.feeSpd,
+        catalog_rpm: limits.catalogRpm,
+      },
     };
   }
 }
