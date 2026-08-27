@@ -83,6 +83,12 @@ export function resolveConfig(env = process.env) {
       id = keyStr.substring(0, colonIdx);
       secretPart = keyStr.substring(colonIdx + 1);
     }
+    // Validate that key id can be used in env var names (alphanumeric and underscore only)
+    if (!/^[A-Za-z0-9_]+$/.test(id)) {
+      throw new Error(
+        `API key id "${id}" contains invalid characters. Key ids must be alphanumeric and underscore only to work with RATE_LIMIT_ overrides.`
+      );
+    }
     return {
       id,
       hash: crypto.createHash('sha256').update(secretPart).digest(),
@@ -117,10 +123,19 @@ export function resolveConfig(env = process.env) {
     keys: {},
   };
 
+  // Build a set of configured key ids (uppercased) for validation
+  const configuredKeyIds = new Set(apiKeys.map(k => k.id.toUpperCase()));
+
   for (const k of Object.keys(env)) {
     if (k.startsWith('RATE_LIMIT_') && k !== 'RATE_LIMIT_GLOBAL') {
       const keyId = k.substring(11); // remove RATE_LIMIT_
-      rateLimits.keys[keyId] = parseLimits(env[k]);
+      // Validate that the key id exists in configured API keys (case-insensitive)
+      if (!configuredKeyIds.has(keyId.toUpperCase())) {
+        throw new Error(
+          `RATE_LIMIT_${keyId} is configured but no API key with id "${keyId}" exists in FACILITATOR_API_KEYS.`
+        );
+      }
+      rateLimits.keys[keyId.toUpperCase()] = parseLimits(env[k]);
     }
   }
 
@@ -209,6 +224,7 @@ export function resolveConfig(env = process.env) {
     /** Optional shared stores. Unset means in-memory, single-instance. */
     redisUrl: env.REDIS_URL || null,
     databaseUrl: env.DATABASE_URL || null,
+    rateLimitStore: env.RATE_LIMIT_STORE || 'memory',
 
     /**
      * Redlock nodes (#116): comma-separated independent Redis masters. Quorum
@@ -219,6 +235,32 @@ export function resolveConfig(env = process.env) {
       .split(',')
       .map(s => s.trim())
       .filter(Boolean),
+
+    /**
+     * Multi-region failover (#126).
+     *
+     * REGION: this instance's region identifier (e.g. "us-east-1"). Unset
+     * means single-region; the CRDT rate limit store and failover health
+     * checker are disabled.
+     *
+     * REGIONS: comma-separated list of all regions and their priorities.
+     * Format: region:priority:healthUrl — e.g.
+     *   us-east-1:1:http://us-east-1.facilitator.example.com
+     *   eu-west-1:2:http://eu-west-1.facilitator.example.com
+     *
+     * RATE_LIMIT_STORE: when set to "crdt" (with DATABASE_URL pointing to a
+     * CockroachDB or multi-region Postgres cluster), uses the CRDT G-Counter
+     * store for region-aware rate limiting that survives partitions.
+     */
+    region: env.REGION || null,
+    regions: (env.REGIONS ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(entry => {
+        const [region, priority, url] = entry.split(':');
+        return { region, priority: Number(priority) || 1, url: url || null };
+      }),
 
     /**
      * Kafka (#117). Brokers unset means webhooks are delivered directly,
