@@ -38,9 +38,14 @@ import Fastify from 'fastify';
 import { validateForCatalog } from './catalog/validation.js';
 import { createAuditLogger } from './audit.js';
 import { createReadinessChecker } from './readiness.js';
+ feat/observability
 import { validatePaymentBody } from './request-validation.js';
 import { createRequestLog } from './log.js';
 import { createMetrics } from './metrics.js';
+
+import { validatePaymentBody, validatePaymentFields } from './request-validation.js';
+import { requestLogger } from './logger.js';
+ main
 import { lockKeyFor } from './distributed-lock.js';
 import { requestState } from './request-state.js';
 import { signerMetrics } from './metrics.js';
@@ -101,6 +106,7 @@ const PAYMENT_BODY_SCHEMA = {
  * @returns {import('fastify').FastifyInstance}
  */
 export function createApp(config, facilitator, rateLimiter, catalog, idempotency, extras = {}) {
+ feat/observability
   const { distributedLock = null, webhooks = null, failoverHealth = null } = extras;
 
   // Observability collaborators. Both are injectable so tests can capture the
@@ -123,6 +129,12 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   const serveMetrics = extras.serveMetrics !== false;
 
   const {
+
+  const { 
+    distributedLock = null, 
+    webhooks = null, 
+    failoverHealth = null,
+ main
     settlementStore = extras.settlementStore ?? buildSettlementStore(config),
   } = extras;
   const app = Fastify({
@@ -503,9 +515,13 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         presentedHash.length === apiKey.hash.length &&
         crypto.timingSafeEqual(presentedHash, apiKey.hash)
       ) {
+ feat/observability
         req.keyId = apiKey.id;
         // For the structured request log (keyId from #5).
         if (req.span) req.span.keyId = apiKey.id;
+
+        req.keyId = apiKey.id.toUpperCase();
+ main
         return;
       }
     }
@@ -607,6 +623,36 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           invalidMessage: result.message,
         });
       }
+      return null;
+    }
+    return {
+      paymentPayload: result.paymentPayload,
+      paymentRequirements: result.paymentRequirements,
+    };
+  }
+
+  function readDiscoveryBody(req, reply) {
+    let result;
+    if (req.validationError) {
+      const detail = Array.isArray(req.validationError.validation)
+        ? req.validationError.validation[0]
+        : undefined;
+      result = {
+        valid: false,
+        reason: 'invalid_request',
+        message: detail?.message
+          ? `${detail.instancePath ?? detail.params?.missingProperty ?? 'body'} ${detail.message}`.trim()
+          : (req.validationError.message ?? 'invalid request body'),
+      };
+    } else {
+      result = validatePaymentFields(req.body);
+    }
+
+    if (!result.valid) {
+      reply.code(400).send({
+        error: 'invalid_resource',
+        reason: result.reason,
+      });
       return null;
     }
     return {
@@ -744,11 +790,21 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         //
         // An open RPC breaker gets its own code so a caller can tell "the chain
         // is unreachable" from "your payment was rejected" (#105, #6).
+        const network = body?.paymentRequirements?.network ?? 'unknown';
+        const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
+        console.error(
+          `[/verify] Exception: route=/verify network=${network} scheme=${scheme} ` +
+          `error=${err instanceof Error ? err.message : String(err)} ` +
+          `stack=${err instanceof Error ? err.stack : 'no stack'}`
+        );
+        
         let invalidReason = 'facilitator_error';
         if (err?.code === 'REQUEST_TIMEOUT') {
           invalidReason = 'request_timeout';
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           invalidReason = 'soroban_rpc_unreachable';
+        } else if (err?.message?.includes('unregistered') || err?.message?.includes('scheme')) {
+          invalidReason = 'unsupported_scheme_network';
         }
         if (req.span) {
           req.span.outcome = 'error';
@@ -779,9 +835,6 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       attachValidation: true,
     },
     async (req, reply) => {
-      const check = await rateLimiter.checkSettle(req);
-      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
-
       const body = readPaymentBody(req, reply, 'settle');
       if (!body) return reply;
       const network = body.paymentRequirements.network;
@@ -790,6 +843,10 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         req.span.network = network;
         req.span.scheme = body.paymentRequirements.scheme;
       }
+
+      const network = body.paymentRequirements.network;
+      const check = await rateLimiter.checkSettle(req, network);
+      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
 
       const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
       const existingRecord = await settlementStore.get(idempotencyKey);
@@ -985,6 +1042,14 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         // A lock that never freed under healthy Redis gets its own code (#116),
         // and an open RPC breaker gets its own code so a caller can tell "the
         // chain is unreachable" from "your payment was rejected" (#105, #6).
+        const network = body?.paymentRequirements?.network ?? 'unknown';
+        const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
+        console.error(
+          `[/settle] Exception: route=/settle network=${network} scheme=${scheme} ` +
+          `error=${err instanceof Error ? err.message : String(err)} ` +
+          `stack=${err instanceof Error ? err.stack : 'no stack'}`
+        );
+        
         let errorReason = 'facilitator_error';
         if (err?.code === 'SUBMITTED_OUTCOME_UNKNOWN') {
           errorReason = 'submitted_outcome_unknown';
@@ -995,6 +1060,8 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           errorReason = 'soroban_rpc_unreachable';
           audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'settle' });
+        } else if (err?.message?.includes('unregistered') || err?.message?.includes('scheme')) {
+          errorReason = 'unsupported_scheme_network';
         }
         if (req.span) {
           req.span.outcome = 'error';
@@ -1094,7 +1161,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       attachValidation: true,
     },
     async (req, reply) => {
-      const body = readPaymentBody(req, reply);
+      const body = readDiscoveryBody(req, reply);
       if (!body) return reply;
 
       const check = await rateLimiter.checkCatalog(req);
@@ -1121,12 +1188,28 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         });
         return reply.send({ ok: true, resource: entry, softDrops: validation.softDrops });
       } catch (err) {
-        return reply.code(400).send({ error: 'catalog_error', reason: err.message });
+        console.error(`[Catalog] manual upsert error: ${err.message}`);
+        return reply.code(400).send({ error: 'catalog_error', reason: 'catalog_error' });
       }
     },
   );
 
+  /**
+   * GET /discovery/resources — public catalog read.
+   *
+   * Public reads are intentional: a discovery catalog that agents cannot browse
+   * is not much of a catalog. The endpoint is unauthenticated but rate-limited
+   * to prevent abuse. Reads use a separate bucket from writes (catalogReadRpm)
+   * because they have very different cost profiles.
+   *
+   * Pagination is clamped at the API boundary before passing to the catalog.
+   * The catalog may assume validated input; duplicated defensive clamping in
+   * the catalog implementation is acceptable if documented.
+   */
   app.get('/discovery/resources', { onRequest: cors('public') }, async (req, reply) => {
+    const check = await rateLimiter.checkCatalogRead(req);
+    if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/resources', check);
+
     let extensions;
     if (req.query.extensions) {
       extensions = Array.isArray(req.query.extensions)
@@ -1134,39 +1217,58 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         : req.query.extensions.split(',');
     }
 
+    // Clamp pagination at the boundary before calling catalog
+    let parsedLimit = parseInt(req.query.limit, 10);
+    if (isNaN(parsedLimit)) parsedLimit = 20;
+    const clampedLimit = Math.min(Math.max(1, parsedLimit), 100);
+
+    let parsedOffset = parseInt(req.query.offset, 10);
+    if (isNaN(parsedOffset)) parsedOffset = 0;
+    const clampedOffset = Math.max(0, parsedOffset);
+
     const params = {
       type: req.query.type,
       payTo: req.query.payTo,
       scheme: req.query.scheme,
       network: req.query.network,
       extensions,
-      limit: req.query.limit,
-      offset: req.query.offset,
+      limit: clampedLimit,
+      offset: clampedOffset,
     };
 
     try {
       const result = await catalog.listResources(params);
-      let parsedLimit = parseInt(params.limit, 10);
-      if (isNaN(parsedLimit)) parsedLimit = 20;
-
-      let parsedOffset = parseInt(params.offset, 10);
-      if (isNaN(parsedOffset)) parsedOffset = 0;
+      await rateLimiter.recordCatalogRead(req);
+      handleRateLimit(reply, check);
 
       return reply.send({
         x402Version: 2,
         items: result.items,
         pagination: {
-          limit: Math.min(Math.max(1, parsedLimit), 100),
-          offset: Math.max(0, parsedOffset),
+          limit: clampedLimit,
+          offset: clampedOffset,
           total: result.total,
         },
       });
     } catch (err) {
-      return reply.code(500).send({ error: 'internal_error', message: err.message });
+      console.error(`[Discovery] listResources error: ${err.message}`);
+      return reply.code(500).send({ error: 'internal_error', reason: 'internal_error' });
     }
   });
 
+  /**
+   * GET /discovery/search — public catalog search.
+   *
+   * Public search is intentional for the same reason as listResources. This
+   * endpoint is more expensive than listResources (it delegates to embeddings.js),
+   * so it shares the catalog_read bucket but is weighted accordingly in config.
+   *
+   * Pagination is clamped at the API boundary before passing to the catalog.
+   */
   app.get('/discovery/search', { onRequest: cors('public') }, async (req, reply) => {
+    const check = await rateLimiter.checkCatalogRead(req);
+    if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/search', check);
+
     if (!req.query.query) {
       return reply.code(400).send({ error: 'invalid_request', reason: 'query is required' });
     }
@@ -1178,6 +1280,11 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         : req.query.extensions.split(',');
     }
 
+    // Clamp pagination at the boundary before calling catalog
+    let parsedLimit = parseInt(req.query.limit, 10);
+    if (isNaN(parsedLimit)) parsedLimit = 20;
+    const clampedLimit = Math.min(Math.max(1, parsedLimit), 100);
+
     const params = {
       query: req.query.query,
       type: req.query.type,
@@ -1185,12 +1292,15 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       scheme: req.query.scheme,
       network: req.query.network,
       extensions,
-      limit: req.query.limit,
+      limit: clampedLimit,
       cursor: req.query.cursor,
     };
 
     try {
       const result = await catalog.search(params);
+      await rateLimiter.recordCatalogRead(req);
+      handleRateLimit(reply, check);
+
       return reply.send({
         x402Version: 2,
         resources: result.resources,
@@ -1198,7 +1308,8 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         pagination: result.pagination,
       });
     } catch (err) {
-      return reply.code(500).send({ error: 'internal_error', message: err.message });
+      console.error(`[Discovery] search error: ${err.message}`);
+      return reply.code(500).send({ error: 'internal_error', reason: 'internal_error' });
     }
   });
 
