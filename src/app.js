@@ -195,9 +195,11 @@ async function tracedSchemeCall(op, network, fn, extraAttrs = {}) {
  *   - audit: audit writer override (default createAuditLogger)
  *   - readiness: readiness checker override
  *   - breakerStates: breaker-state reader for the readiness probe (#105)
+ *   - failoverHealth (#126): region-aware failover health checker
  * @returns {import('fastify').FastifyInstance}
  */
 export function createApp(config, facilitator, rateLimiter, catalog, idempotency, extras = {}) {
+  const { distributedLock = null, webhooks = null, failoverHealth = null } = extras;
   const {
     distributedLock = null,
     webhooks = null,
@@ -407,6 +409,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    * is logged, never surfaced as a payment failure.
    */
   async function processCataloging(req, body, reply, source = 'payment') {
+    try {
     const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
     const outcome = {};
 
@@ -477,6 +480,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       'EXTENSION-RESPONSES',
       Buffer.from(JSON.stringify({ bazaar: outcome })).toString('base64'),
     );
+    } catch (err) {
+      console.error('[Catalog] Unhandled error during processCataloging:', err);
+    }
   }
 
   /**
@@ -650,14 +656,21 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    */
   app.get('/readyz', async (_req, reply) => {
     if (!readiness) {
-      return reply.code(503).send({
+      const response = {
         ok: false,
         status: 'not_ready',
         reason: 'readiness_not_configured',
-      });
+      };
+      if (failoverHealth) {
+        response.failover = failoverHealth.getState();
+      }
+      return reply.code(503).send(response);
     }
     try {
       const report = await readiness.check();
+      if (failoverHealth) {
+        report.failover = failoverHealth.getState();
+      }
       return reply.code(report.ok ? 200 : 503).send(report);
     } catch (err) {
       return reply.code(503).send({ ok: false, status: 'not_ready', error: err.message });
@@ -917,6 +930,7 @@ feat/opentelemetry-tracing
 
       try {
         const settleOnce = async () => {
+ feat/opentelemetry-tracing
           const result = await tracedSchemeCall(
             'settle',
             body.paymentRequirements.network,
@@ -927,6 +941,13 @@ feat/opentelemetry-tracing
             req,
             result.success ? result.transactionFeeStroops || 0 : 0,
           );
+
+          const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
+          const network = body.paymentRequirements.network;
+          const maxFee = config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000;
+          const feeCharged = result.success ? maxFee : 0;
+          await rateLimiter.recordSettle(req, feeCharged);
+ main
           handleRateLimit(reply, check);
           if (result.success) {
             await settlementStore.updateState(idempotencyKey, 'settled', {
@@ -1066,6 +1087,34 @@ feat/opentelemetry-tracing
       }
 
       return reply.send({ ok: true, settlement: record });
+    },
+  );
+
+  /**
+   * GET /settlements/:idempotencyKey/events — full, ordered event history for
+   * one settlement (#130). The projection above answers "what is the current
+   * state"; this answers "how did it get there" — the record a regulatory
+   * audit needs. Scoped identically to the settlement it belongs to.
+   */
+  app.get(
+    '/settlements/:idempotencyKey/events',
+    {
+      onRequest: cors('authenticated'),
+      preHandler: requireApiKey,
+    },
+    async (req, reply) => {
+      const { idempotencyKey } = req.params;
+      const record = await settlementStore.get(idempotencyKey);
+      if (!record) {
+        return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
+      }
+
+      if (req.keyId && record.key_id && record.key_id !== req.keyId) {
+        return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
+      }
+
+      const events = await settlementStore.getEventLog(idempotencyKey);
+      return reply.send({ ok: true, idempotencyKey, events });
     },
   );
 
