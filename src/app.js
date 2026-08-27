@@ -100,9 +100,9 @@ const PAYMENT_BODY_SCHEMA = {
  * @returns {import('fastify').FastifyInstance}
  */
 export function createApp(config, facilitator, rateLimiter, catalog, idempotency, extras = {}) {
-  const { 
-    distributedLock = null, 
-    webhooks = null, 
+  const {
+    distributedLock = null,
+    webhooks = null,
     failoverHealth = null,
     settlementStore = extras.settlementStore ?? buildSettlementStore(config),
   } = extras;
@@ -311,76 +311,76 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
    */
   async function processCataloging(req, body, reply, source = 'payment') {
     try {
-    const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
-    const outcome = {};
+      const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
+      const outcome = {};
 
-    if (validation.hardDrop) {
-      if (validation.reason === 'missing_or_invalid_discovery_extension') {
-        outcome.status = 'not attempted';
-      } else {
-        outcome.status = 'rejected';
-        outcome.code = validation.reason;
-        console.warn(`[Catalog] Hard drop: ${validation.reason}`);
-      }
-    } else {
-      const checkResult = await rateLimiter.checkCatalog(req);
-      if (!checkResult.allowed) {
-        outcome.status = 'rejected';
-        outcome.code = 'catalog_rate_limited';
-        outcome.reason = checkResult.reason;
-        console.warn(`[Catalog] Rate limit exceeded for IP ${req.ip}`);
-        // Audited as a rejection but never allowed to shape the payment
-        // response: the 429/headers belong to the payment limiter, not here.
-        audit('rate_limit_rejected', {
-          actor: req.keyId ?? `ip:${req.ip}`,
-          route: 'catalog',
-          reason: checkResult.reason,
-          outcome_override: outcome.code,
-        });
-      } else {
-        if (validation.softDrops.length > 0) {
-          outcome.status = 'partially landed';
-          outcome.code = 'catalog_partial';
-          outcome.reason = `Dropped fields: ${validation.softDrops.join(', ')}`;
-          console.warn(
-            `[Catalog] Soft drops for ${validation.resource.url}: ${validation.softDrops.join(', ')}`,
-          );
+      if (validation.hardDrop) {
+        if (validation.reason === 'missing_or_invalid_discovery_extension') {
+          outcome.status = 'not attempted';
         } else {
-          outcome.status = 'landed';
-          outcome.code = 'catalog_success';
+          outcome.status = 'rejected';
+          outcome.code = validation.reason;
+          console.warn(`[Catalog] Hard drop: ${validation.reason}`);
         }
-
-        await rateLimiter.recordCatalog(req);
-
-        // Off the hot path. Cataloging must never delay or fail a payment.
-        Promise.resolve().then(async () => {
-          try {
-            const existing = await catalog.getResource?.(
-              validation.resource.url,
-              validation.resource.toolName ?? null,
+      } else {
+        const checkResult = await rateLimiter.checkCatalog(req);
+        if (!checkResult.allowed) {
+          outcome.status = 'rejected';
+          outcome.code = 'catalog_rate_limited';
+          outcome.reason = checkResult.reason;
+          console.warn(`[Catalog] Rate limit exceeded for IP ${req.ip}`);
+          // Audited as a rejection but never allowed to shape the payment
+          // response: the 429/headers belong to the payment limiter, not here.
+          audit('rate_limit_rejected', {
+            actor: req.keyId ?? `ip:${req.ip}`,
+            route: 'catalog',
+            reason: checkResult.reason,
+            outcome_override: outcome.code,
+          });
+        } else {
+          if (validation.softDrops.length > 0) {
+            outcome.status = 'partially landed';
+            outcome.code = 'catalog_partial';
+            outcome.reason = `Dropped fields: ${validation.softDrops.join(', ')}`;
+            console.warn(
+              `[Catalog] Soft drops for ${validation.resource.url}: ${validation.softDrops.join(', ')}`,
             );
-            await catalog.upsertResource(validation.resource, source);
-            // A public listing being created or overwritten is public state
-            // changing — recorded so a spoofed listing can be investigated
-            // after the fact.
-            audit('catalog_write', {
-              actor: req.keyId ?? `ip:${req.ip}`,
-              source,
-              url: validation.resource.url,
-              tool_name: validation.resource.toolName ?? null,
-              overwritten: Boolean(existing),
-            });
-          } catch (err) {
-            console.warn(`[Catalog] Async cataloging failed: ${err.message}`);
+          } else {
+            outcome.status = 'landed';
+            outcome.code = 'catalog_success';
           }
-        });
-      }
-    }
 
-    reply.header(
-      'EXTENSION-RESPONSES',
-      Buffer.from(JSON.stringify({ bazaar: outcome })).toString('base64'),
-    );
+          await rateLimiter.recordCatalog(req);
+
+          // Off the hot path. Cataloging must never delay or fail a payment.
+          Promise.resolve().then(async () => {
+            try {
+              const existing = await catalog.getResource?.(
+                validation.resource.url,
+                validation.resource.toolName ?? null,
+              );
+              await catalog.upsertResource(validation.resource, source);
+              // A public listing being created or overwritten is public state
+              // changing — recorded so a spoofed listing can be investigated
+              // after the fact.
+              audit('catalog_write', {
+                actor: req.keyId ?? `ip:${req.ip}`,
+                source,
+                url: validation.resource.url,
+                tool_name: validation.resource.toolName ?? null,
+                overwritten: Boolean(existing),
+              });
+            } catch (err) {
+              console.warn(`[Catalog] Async cataloging failed: ${err.message}`);
+            }
+          });
+        }
+      }
+
+      reply.header(
+        'EXTENSION-RESPONSES',
+        Buffer.from(JSON.stringify({ bazaar: outcome })).toString('base64'),
+      );
     } catch (err) {
       console.error('[Catalog] Unhandled error during processCataloging:', err);
     }
@@ -681,16 +681,16 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
         console.error(
           `[/verify] Exception: route=/verify network=${network} scheme=${scheme} ` +
-          `error=${err instanceof Error ? err.message : String(err)} ` +
-          `stack=${err instanceof Error ? err.stack : 'no stack'}`
+            `error=${err instanceof Error ? err.message : String(err)} ` +
+            `stack=${err instanceof Error ? err.stack : 'no stack'}`,
         );
-        
+
         let invalidReason = 'facilitator_error';
         if (err?.code === 'REQUEST_TIMEOUT') {
           invalidReason = 'request_timeout';
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           invalidReason = 'soroban_rpc_unreachable';
-        } else if (err?.message?.includes('unregistered') || err?.message?.includes('scheme')) {
+        } else if (err?.message?.includes('unregistered')) {
           invalidReason = 'unsupported_scheme_network';
         }
         if (invalidReason !== 'facilitator_error') {
@@ -829,26 +829,40 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           await rateLimiter.recordSettle(req, feeCharged);
           handleRateLimit(reply, check);
           if (result.success) {
-            await settlementStore.updateState(idempotencyKey, 'settled', {
-              tx_hash: result.transaction,
-              response: result,
-            });
+            // Settlement notification (#123): the event is written to the
+            // outbox in the SAME database transaction as the 'settled' state
+            // change, so a crash between settling and notifying cannot lose
+            // the notification — the outbox worker publishes it afterwards.
+            // Only when no durable outbox exists (in-memory store or degraded
+            // Postgres) do we fall back to the fire-and-forget webhook
+            // publish (#117), which is the pre-outbox behaviour.
+            const event = webhooks
+              ? {
+                  type: 'settlement.completed',
+                  transaction: result.transaction,
+                  network: result.network,
+                  payer: result.payer,
+                  payTo: body.paymentRequirements.payTo,
+                  amount: body.paymentRequirements.maxAmountRequired,
+                  asset: body.paymentRequirements.asset,
+                }
+              : null;
+
+            const enqueued = await settlementStore.settleAndEnqueue(
+              idempotencyKey,
+              { tx_hash: result.transaction, response: result },
+              event,
+            );
 
             await processCataloging(req, body, reply, 'payment');
 
-            // Webhook notification (#117): published, not delivered inline.
-            // A slow receiving server must never sit inside this HTTP
-            // request's lifecycle — see src/webhooks/.
-            if (webhooks && typeof webhooks.enqueue === 'function') {
-              webhooks.enqueue({
-                type: 'settlement.completed',
-                transaction: result.transaction,
-                network: result.network,
-                payer: result.payer,
-                payTo: body.paymentRequirements.payTo,
-                amount: body.paymentRequirements.maxAmountRequired,
-                asset: body.paymentRequirements.asset,
-              });
+            if (
+              !enqueued.atomicallyEnqueued &&
+              enqueued.event &&
+              webhooks &&
+              typeof webhooks.enqueue === 'function'
+            ) {
+              webhooks.enqueue(enqueued.event);
             }
           } else {
             await settlementStore.updateState(idempotencyKey, 'failed', {
@@ -909,10 +923,10 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
         console.error(
           `[/settle] Exception: route=/settle network=${network} scheme=${scheme} ` +
-          `error=${err instanceof Error ? err.message : String(err)} ` +
-          `stack=${err instanceof Error ? err.stack : 'no stack'}`
+            `error=${err instanceof Error ? err.message : String(err)} ` +
+            `stack=${err instanceof Error ? err.stack : 'no stack'}`,
         );
-        
+
         let errorReason = 'facilitator_error';
         if (err?.code === 'SUBMITTED_OUTCOME_UNKNOWN') {
           errorReason = 'submitted_outcome_unknown';
@@ -923,7 +937,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           errorReason = 'soroban_rpc_unreachable';
           audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'settle' });
-        } else if (err?.message?.includes('unregistered') || err?.message?.includes('scheme')) {
+        } else if (err?.message?.includes('unregistered')) {
           errorReason = 'unsupported_scheme_network';
         }
 
@@ -970,7 +984,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
       }
 
-      if (req.keyId && record.key_id && record.key_id !== req.keyId) {
+      // Key ids are case-insensitive by design (normalized to uppercase at
+      // auth, see requireApiKey), so compare against the normalized form.
+      if (req.keyId && record.key_id && record.key_id.toUpperCase() !== req.keyId) {
         return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
       }
 
@@ -997,7 +1013,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
       }
 
-      if (req.keyId && record.key_id && record.key_id !== req.keyId) {
+      // Key ids are case-insensitive by design (normalized to uppercase at
+      // auth, see requireApiKey), so compare against the normalized form.
+      if (req.keyId && record.key_id && record.key_id.toUpperCase() !== req.keyId) {
         return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
       }
 
