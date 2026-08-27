@@ -997,12 +997,28 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         });
         return reply.send({ ok: true, resource: entry, softDrops: validation.softDrops });
       } catch (err) {
-        return reply.code(400).send({ error: 'catalog_error', reason: err.message });
+        console.error(`[Catalog] manual upsert error: ${err.message}`);
+        return reply.code(400).send({ error: 'catalog_error', reason: 'catalog_error' });
       }
     },
   );
 
+  /**
+   * GET /discovery/resources — public catalog read.
+   *
+   * Public reads are intentional: a discovery catalog that agents cannot browse
+   * is not much of a catalog. The endpoint is unauthenticated but rate-limited
+   * to prevent abuse. Reads use a separate bucket from writes (catalogReadRpm)
+   * because they have very different cost profiles.
+   *
+   * Pagination is clamped at the API boundary before passing to the catalog.
+   * The catalog may assume validated input; duplicated defensive clamping in
+   * the catalog implementation is acceptable if documented.
+   */
   app.get('/discovery/resources', { onRequest: cors('public') }, async (req, reply) => {
+    const check = await rateLimiter.checkCatalogRead(req);
+    if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/resources', check);
+
     let extensions;
     if (req.query.extensions) {
       extensions = Array.isArray(req.query.extensions)
@@ -1010,39 +1026,58 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         : req.query.extensions.split(',');
     }
 
+    // Clamp pagination at the boundary before calling catalog
+    let parsedLimit = parseInt(req.query.limit, 10);
+    if (isNaN(parsedLimit)) parsedLimit = 20;
+    const clampedLimit = Math.min(Math.max(1, parsedLimit), 100);
+
+    let parsedOffset = parseInt(req.query.offset, 10);
+    if (isNaN(parsedOffset)) parsedOffset = 0;
+    const clampedOffset = Math.max(0, parsedOffset);
+
     const params = {
       type: req.query.type,
       payTo: req.query.payTo,
       scheme: req.query.scheme,
       network: req.query.network,
       extensions,
-      limit: req.query.limit,
-      offset: req.query.offset,
+      limit: clampedLimit,
+      offset: clampedOffset,
     };
 
     try {
       const result = await catalog.listResources(params);
-      let parsedLimit = parseInt(params.limit, 10);
-      if (isNaN(parsedLimit)) parsedLimit = 20;
-
-      let parsedOffset = parseInt(params.offset, 10);
-      if (isNaN(parsedOffset)) parsedOffset = 0;
+      await rateLimiter.recordCatalogRead(req);
+      handleRateLimit(reply, check);
 
       return reply.send({
         x402Version: 2,
         items: result.items,
         pagination: {
-          limit: Math.min(Math.max(1, parsedLimit), 100),
-          offset: Math.max(0, parsedOffset),
+          limit: clampedLimit,
+          offset: clampedOffset,
           total: result.total,
         },
       });
     } catch (err) {
-      return reply.code(500).send({ error: 'internal_error', message: err.message });
+      console.error(`[Discovery] listResources error: ${err.message}`);
+      return reply.code(500).send({ error: 'internal_error', reason: 'internal_error' });
     }
   });
 
+  /**
+   * GET /discovery/search — public catalog search.
+   *
+   * Public search is intentional for the same reason as listResources. This
+   * endpoint is more expensive than listResources (it delegates to embeddings.js),
+   * so it shares the catalog_read bucket but is weighted accordingly in config.
+   *
+   * Pagination is clamped at the API boundary before passing to the catalog.
+   */
   app.get('/discovery/search', { onRequest: cors('public') }, async (req, reply) => {
+    const check = await rateLimiter.checkCatalogRead(req);
+    if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/search', check);
+
     if (!req.query.query) {
       return reply.code(400).send({ error: 'invalid_request', reason: 'query is required' });
     }
@@ -1054,6 +1089,11 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         : req.query.extensions.split(',');
     }
 
+    // Clamp pagination at the boundary before calling catalog
+    let parsedLimit = parseInt(req.query.limit, 10);
+    if (isNaN(parsedLimit)) parsedLimit = 20;
+    const clampedLimit = Math.min(Math.max(1, parsedLimit), 100);
+
     const params = {
       query: req.query.query,
       type: req.query.type,
@@ -1061,12 +1101,15 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       scheme: req.query.scheme,
       network: req.query.network,
       extensions,
-      limit: req.query.limit,
+      limit: clampedLimit,
       cursor: req.query.cursor,
     };
 
     try {
       const result = await catalog.search(params);
+      await rateLimiter.recordCatalogRead(req);
+      handleRateLimit(reply, check);
+
       return reply.send({
         x402Version: 2,
         resources: result.resources,
@@ -1074,7 +1117,8 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         pagination: result.pagination,
       });
     } catch (err) {
-      return reply.code(500).send({ error: 'internal_error', message: err.message });
+      console.error(`[Discovery] search error: ${err.message}`);
+      return reply.code(500).send({ error: 'internal_error', reason: 'internal_error' });
     }
   });
 
