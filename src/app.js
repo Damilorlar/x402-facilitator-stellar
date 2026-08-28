@@ -44,6 +44,7 @@ import { createMetrics } from './metrics.js';
 
 import { lockKeyFor } from './distributed-lock.js';
 import { requestState } from './request-state.js';
+import { signerMetrics } from './metrics.js';
 import { buildSettlementStore } from './store/index.js';
 
 /** 256kb body cap, carried over unchanged from the Express transport. */
@@ -694,7 +695,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   if (serveMetrics) {
     app.get('/metrics', async (_req, reply) => {
       reply.header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
-      return reply.send(metrics.render());
+      return reply.send(metrics.render() + signerMetrics.toPrometheusText());
     });
   }
 
@@ -923,9 +924,14 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           if (signer) metrics.setSignerInflight({ network, signer, value: 1 });
           try {
             const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
-            const maxFee = config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000;
-            const feeCharged = result.success ? maxFee : 0;
-            await rateLimiter.recordSettle(req, feeCharged);
+            // The fee ceiling (feeSpd) is reserved against the sponsored max, so
+            // the rate limiter is told the worst-case fee per settlement.
+            const sponsoredFee = result.success
+              ? (config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000)
+              : 0;
+            // The metrics/audit record the fee actually paid by this settlement.
+            const actualFee = result.success ? result.transactionFeeStroops || 0 : 0;
+            await rateLimiter.recordSettle(req, sponsoredFee);
             if (req.span) {
               req.span.settleOutcome = result.success ? 'settled' : 'failed';
               req.span.outcome = result.success ? 'ok' : 'rejected';
@@ -933,7 +939,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
                 ? 'none'
                 : (result.errorReason ?? 'settlement_failed');
               req.span.txHash = result.transaction || null;
-              req.span.feeStroops = feeCharged;
+              req.span.feeStroops = actualFee;
             }
             handleRateLimit(reply, check);
             if (result.success) {
@@ -984,7 +990,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
                 outcome: result.success ? 'settled' : 'failed',
                 transaction: result.transaction || null,
                 network: result.network ?? body.paymentRequirements.network,
-                fee_stroops: feeCharged,
+                fee_stroops: actualFee,
                 error_reason: result.errorReason ?? null,
               });
               return result;
@@ -1009,7 +1015,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
               outcome: result.success ? 'settled' : 'failed',
               transaction: result.transaction || null,
               network: result.network ?? body.paymentRequirements.network,
-              fee_stroops: feeCharged,
+              fee_stroops: actualFee,
               error_reason: result.errorReason ?? null,
             });
             return result;
@@ -1043,7 +1049,15 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         // and an open RPC breaker gets its own code so a caller can tell "the
         // chain is unreachable" from "your payment was rejected" (#105, #6).
         let errorReason = 'facilitator_error';
-        if (err instanceof Error && err.name === 'LockAcquireTimeoutError') {
+        if (err?.code === 'REQUEST_TIMEOUT') {
+          // A timeout after the scheme was actually submitted leaves the outcome
+          // unknown on our side: report it distinctly so a caller can reconcile
+          // out of band (#8).
+          errorReason =
+            requestState.getStore()?.submitted === true
+              ? 'submitted_outcome_unknown'
+              : 'request_timeout';
+        } else if (err instanceof Error && err.name === 'LockAcquireTimeoutError') {
           errorReason = 'lock_timeout';
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           errorReason = 'soroban_rpc_unreachable';
