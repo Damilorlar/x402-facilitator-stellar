@@ -35,8 +35,6 @@
  */
 import crypto from 'node:crypto';
 import Fastify from 'fastify';
-import { trace, context, propagation, SpanStatusCode } from '@opentelemetry/api';
-import { tracer } from './tracing.js';
 import { validateForCatalog } from './catalog/validation.js';
 import { createAuditLogger } from './audit.js';
 import { createReadinessChecker } from './readiness.js';
@@ -46,6 +44,8 @@ import { lockKeyFor } from './distributed-lock.js';
 import { requestState } from './request-state.js';
 import { signerMetrics } from './metrics.js';
 import { buildSettlementStore } from './store/index.js';
+import { trace, context, propagation, SpanStatusCode } from '@opentelemetry/api';
+import { tracer } from './tracing.js';
 
 /** 256kb body cap, carried over unchanged from the Express transport. */
 const BODY_LIMIT_BYTES = 256 * 1024;
@@ -75,11 +75,31 @@ const PAYMENT_BODY_SCHEMA = {
 };
 
 /**
- * Attaches metadata to the currently active span (the http server span created
- * by the OTel http instrumentation), if one is active. Never throws when
- * tracing is disabled — getActiveSpan() simply returns undefined then.
+ * Builds the Fastify app.
  *
- * @param {Record<string, string | number | boolean>} attrs
+ * Takes its collaborators rather than reaching for module state, which is what
+ * makes the surface testable: a test can supply a facilitator that throws, a
+ * rate limiter already at its ceiling, or a catalog that rejects a write,
+ * without a network, a keypair or a subprocess.
+ *
+ * `signers` is deliberately not a parameter — no route reads it. The addresses
+ * reach the wire through facilitator.getSupported(); server.js keeps them only
+ * to print the boot banner.
+ *
+ * @param {object} config - resolved config from resolveConfig()
+ * @param {{verify: Function, settle: Function, getSupported: Function}} facilitator
+ * @param {object} rateLimiter - RateLimiter, or a stub with the same surface
+ * @param {{upsertResource: Function, listResources: Function}} catalog
+ * @param {{keyFor: Function, begin: Function, complete: Function}} [idempotency]
+ *   optional idempotency store for /settle; absent means in-memory only
+ * @param {object} [extras] - optional collaborators:
+ *   - distributedLock (#116): Redlock-backed lock for state transitions
+ *   - webhooks (#117): asynchronous webhook dispatcher
+ *   - audit: audit writer override (default createAuditLogger)
+ *   - readiness: readiness checker override
+ *   - breakerStates: breaker-state reader for the readiness probe (#105)
+ *   - failoverHealth (#126): region-aware failover health checker
+ * @returns {import('fastify').FastifyInstance}
  */
 function annotateSpan(attrs) {
   const span = trace.getActiveSpan();
@@ -89,22 +109,6 @@ function annotateSpan(attrs) {
   }
 }
 
-/**
- * Wraps a request handler in an inbound span that continues the upstream W3C
- * trace (extracted from the request headers) and carries route/tenant
- * metadata. Outbound calls made inside — the wrapped `fetch` to Horizon/Soroban
- * RPC, the background webhook delivery — inherit this span as their parent,
- * so the whole request is one correlated trace across service boundaries.
- *
- * Auto http instrumentation cannot reliably patch Fastify v5's ESM module, so
- * the inbound span is created here explicitly. `startActiveSpan` makes it the
- * active context for the duration of `fn`, which is what lets the undici
- * instrumentation parent outbound calls to it.
- *
- * @param {string} name - span name, e.g. 'HTTP POST /settle'
- * @param {object} req - Fastify request
- * @param {(span: import('@opentelemetry/api').Span) => Promise<any>} fn
- */
 async function withRequestSpan(name, req, fn) {
   const parentCtx = propagation.extract(context.active(), req.headers);
   return tracer.startActiveSpan(
@@ -133,22 +137,9 @@ async function withRequestSpan(name, req, fn) {
   );
 }
 
-/**
- * Wraps an ExactStellarScheme call in a child span so chain latency is
- * attributable separately from transport latency. Carries the network and, on
- * success, the settlement transaction hash (the cross-system correlation key a
- * downstream receiver uses to reconcile the payment).
- *
- * @param {string} op - 'verify' | 'settle'
- * @param {string} network
- * @param {() => Promise<any>} fn
- * @param {Record<string, string | number | boolean>} [extraAttrs]
- */
 async function tracedSchemeCall(op, network, fn, extraAttrs = {}) {
   return tracer.startActiveSpan(`facilitator.${op}`, async span => {
     span.setAttribute('x402.network', network);
-    // Carry request-level metadata (e.g. tenant.id) onto the scheme span so the
-    // correlation survives even when no inbound server span is the active one.
     for (const [key, value] of Object.entries(extraAttrs)) {
       span.setAttribute(key, value);
     }
@@ -171,33 +162,6 @@ async function tracedSchemeCall(op, network, fn, extraAttrs = {}) {
   });
 }
 
-/**
- * Builds the Fastify app.
- *
- * Takes its collaborators rather than reaching for module state, which is what
- * makes the surface testable: a test can supply a facilitator that throws, a
- * rate limiter already at its ceiling, or a catalog that rejects a write,
- * without a network, a keypair or a subprocess.
- *
- * `signers` is deliberately not a parameter — no route reads it. The addresses
- * reach the wire through facilitator.getSupported(); server.js keeps them only
- * to print the boot banner.
- *
- * @param {object} config - resolved config from resolveConfig()
- * @param {{verify: Function, settle: Function, getSupported: Function}} facilitator
- * @param {object} rateLimiter - RateLimiter, or a stub with the same surface
- * @param {{upsertResource: Function, listResources: Function}} catalog
- * @param {{keyFor: Function, begin: Function, complete: Function}} [idempotency]
- *   optional idempotency store for /settle; absent means in-memory only
- * @param {object} [extras] - optional collaborators:
- *   - distributedLock (#116): Redlock-backed lock for state transitions
- *   - webhooks (#117): asynchronous webhook dispatcher
- *   - audit: audit writer override (default createAuditLogger)
- *   - readiness: readiness checker override
- *   - breakerStates: breaker-state reader for the readiness probe (#105)
- *   - failoverHealth (#126): region-aware failover health checker
- * @returns {import('fastify').FastifyInstance}
- */
 export function createApp(config, facilitator, rateLimiter, catalog, idempotency, extras = {}) {
   const {
     distributedLock = null,
@@ -730,7 +694,6 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       attachValidation: true,
     },
     async (req, reply) => {
-feat/opentelemetry-tracing
       return withRequestSpan(`HTTP ${req.method} /verify`, req, async () => {
         const check = await rateLimiter.checkVerify(req);
         if (!check.allowed) return rejectRateLimited(req, reply, '/verify', check);
@@ -740,12 +703,27 @@ feat/opentelemetry-tracing
         try {
           await rateLimiter.recordVerify(req);
           handleRateLimit(reply, check);
-          const result = await tracedSchemeCall(
+
+          const timeoutMs = config.requestTimeoutMs ?? 30_000;
+          let timeoutTimer;
+          const timeoutPromise = new Promise((_, reject) => {
+            timeoutTimer = setTimeout(() => {
+              const err = new Error('request timeout');
+              err.code = 'REQUEST_TIMEOUT';
+              reject(err);
+            }, timeoutMs);
+          });
+
+          const verifyPromise = tracedSchemeCall(
             'verify',
             body.paymentRequirements.network,
             () => facilitator.verify(body.paymentPayload, body.paymentRequirements),
             { 'tenant.id': req.keyId ?? 'open' },
           );
+          const result = await Promise.race([verifyPromise, timeoutPromise]).finally(() => {
+            clearTimeout(timeoutTimer);
+          });
+
           audit('verification', {
             actor: req.keyId ?? `ip:${req.ip}`,
             outcome: result.isValid ? 'valid' : 'invalid',
@@ -769,85 +747,33 @@ feat/opentelemetry-tracing
           //
           // An open RPC breaker gets its own code so a caller can tell "the chain
           // is unreachable" from "your payment was rejected" (#105, #6).
-          const invalidReason =
-            err?.code === 'RPC_BREAKER_OPEN' ? 'soroban_rpc_unreachable' : 'facilitator_error';
+          const network = body?.paymentRequirements?.network ?? 'unknown';
+          const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
+          console.error(
+            `[/verify] Exception: route=/verify network=${network} scheme=${scheme} ` +
+              `error=${err instanceof Error ? err.message : String(err)} ` +
+              `stack=${err instanceof Error ? err.stack : 'no stack'}`,
+          );
+
+          let invalidReason = 'facilitator_error';
+          if (err?.code === 'REQUEST_TIMEOUT') {
+            invalidReason = 'request_timeout';
+          } else if (err?.code === 'RPC_BREAKER_OPEN') {
+            invalidReason = 'soroban_rpc_unreachable';
+          } else if (err?.message?.includes('unregistered')) {
+            invalidReason = 'unsupported_scheme_network';
+          }
           if (invalidReason !== 'facilitator_error') {
-            audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'verify' });
+            audit('rpc_unreachable', {
+              actor: req.keyId ?? `ip:${req.ip}`,
+              op: 'verify',
+              reason: invalidReason,
+            });
           }
           return reply.send({
             isValid: false,
             invalidReason,
             invalidMessage: err instanceof Error ? err.message : String(err),
-
-      const check = await rateLimiter.checkVerify(req);
-      if (!check.allowed) return rejectRateLimited(req, reply, '/verify', check);
-
-      const body = readPaymentBody(req, reply);
-      if (!body) return reply;
-      try {
-        await rateLimiter.recordVerify(req);
-        handleRateLimit(reply, check);
-
-        const timeoutMs = config.requestTimeoutMs ?? 30_000;
-        let timeoutTimer;
-        const timeoutPromise = new Promise((_, reject) => {
-          timeoutTimer = setTimeout(() => {
-            const err = new Error('request timeout');
-            err.code = 'REQUEST_TIMEOUT';
-            reject(err);
-          }, timeoutMs);
-        });
-
-        const verifyPromise = facilitator.verify(body.paymentPayload, body.paymentRequirements);
-        const result = await Promise.race([verifyPromise, timeoutPromise]).finally(() => {
-          clearTimeout(timeoutTimer);
-        });
-
-        audit('verification', {
-          actor: req.keyId ?? `ip:${req.ip}`,
-          outcome: result.isValid ? 'valid' : 'invalid',
-          invalid_reason: result.invalidReason ?? null,
-          network: body.paymentRequirements.network,
-        });
-        if (result.isValid) {
-          await processCataloging(req, body, reply, 'payment');
-        }
-        return reply.send(result);
-      } catch (err) {
-        // An exception must not become a 500 with an empty body: to a client that
-        // is indistinguishable from the service being down, and it carries no
-        // reason code. Shape it like a verification failure instead.
-        //
-        // Note ExactStellarScheme already absorbs its own internal exceptions and
-        // returns invalidReason "unexpected_verify_error" rather than throwing, so
-        // this path only catches failures above the scheme — an unregistered
-        // scheme/network pair, for instance. A distinct code keeps the two
-        // distinguishable to a client.
-        //
-        // An open RPC breaker gets its own code so a caller can tell "the chain
-        // is unreachable" from "your payment was rejected" (#105, #6).
-        const network = body?.paymentRequirements?.network ?? 'unknown';
-        const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
-        console.error(
-          `[/verify] Exception: route=/verify network=${network} scheme=${scheme} ` +
-            `error=${err instanceof Error ? err.message : String(err)} ` +
-            `stack=${err instanceof Error ? err.stack : 'no stack'}`,
-        );
-
-        let invalidReason = 'facilitator_error';
-        if (err?.code === 'REQUEST_TIMEOUT') {
-          invalidReason = 'request_timeout';
-        } else if (err?.code === 'RPC_BREAKER_OPEN') {
-          invalidReason = 'soroban_rpc_unreachable';
-        } else if (err?.message?.includes('unregistered')) {
-          invalidReason = 'unsupported_scheme_network';
-        }
-        if (invalidReason !== 'facilitator_error') {
-          audit('rpc_unreachable', {
-            actor: req.keyId ?? `ip:${req.ip}`,
-            op: 'verify',
-            reason: invalidReason,
-main
           });
         }
       });
@@ -863,64 +789,19 @@ main
       attachValidation: true,
     },
     async (req, reply) => {
- feat/opentelemetry-tracing
       return withRequestSpan(`HTTP ${req.method} /settle`, req, async () => {
-        const check = await rateLimiter.checkSettle(req);
-        if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
-
         const body = readPaymentBody(req, reply, 'settle');
         if (!body) return reply;
-feat/opentelemetry-tracing
-        /**
 
-      const body = readPaymentBody(req, reply, 'settle');
-      if (!body) return reply;
-main
+        const network = body.paymentRequirements.network;
+        const check = await rateLimiter.checkSettle(req, network);
+        if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
 
-      const network = body.paymentRequirements.network;
-      const check = await rateLimiter.checkSettle(req, network);
-      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
+        const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
+        const existingRecord = await settlementStore.get(idempotencyKey);
 
-      const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
-      const existingRecord = await settlementStore.get(idempotencyKey);
-
-      if (existingRecord) {
-        if (existingRecord.state === 'settled') {
-          handleRateLimit(reply, check);
-          if (existingRecord.response) {
-            const respPayload =
-              typeof existingRecord.response === 'string'
-                ? JSON.parse(existingRecord.response)
-                : existingRecord.response;
-            return reply.send(respPayload);
-          }
-          return reply.send({
-            success: true,
-            transaction: existingRecord.tx_hash,
-            network: existingRecord.network,
-            payer: existingRecord.payer,
-          });
-        }
-        if (existingRecord.state === 'submitted' || existingRecord.state === 'unknown') {
-          handleRateLimit(reply, check);
-          return reply.send({
-            success: false,
-            errorReason: 'submitted_outcome_unknown',
-            errorMessage:
-              existingRecord.error_message || 'settlement in progress or outcome unknown',
-            transaction: existingRecord.tx_hash || '',
-            network: existingRecord.network,
-          });
-        }
-        if (existingRecord.state === 'failed') {
-          const RETRYABLE = new Set([
-            'rate_limited',
-            'catalog_rate_limited',
-            'soroban_rpc_unreachable',
-            'lock_timeout',
-            'request_timeout',
-          ]);
-          if (!RETRYABLE.has(existingRecord.error_reason)) {
+        if (existingRecord) {
+          if (existingRecord.state === 'settled') {
             handleRateLimit(reply, check);
             if (existingRecord.response) {
               const respPayload =
@@ -930,211 +811,237 @@ main
               return reply.send(respPayload);
             }
             return reply.send({
+              success: true,
+              transaction: existingRecord.tx_hash,
+              network: existingRecord.network,
+              payer: existingRecord.payer,
+            });
+          }
+          if (existingRecord.state === 'submitted' || existingRecord.state === 'unknown') {
+            handleRateLimit(reply, check);
+            return reply.send({
               success: false,
-              errorReason: existingRecord.error_reason,
-              errorMessage: existingRecord.error_message,
+              errorReason: 'submitted_outcome_unknown',
+              errorMessage:
+                existingRecord.error_message || 'settlement in progress or outcome unknown',
               transaction: existingRecord.tx_hash || '',
               network: existingRecord.network,
             });
           }
-        }
-      }
-
-      await settlementStore.save({
-        idempotency_key: idempotencyKey,
-        network: body.paymentRequirements.network,
-        scheme: body.paymentRequirements.scheme,
-        payer: body.paymentPayload?.payer ?? null,
-        pay_to: body.paymentRequirements.payTo,
-        asset: body.paymentRequirements.asset,
-        amount: body.paymentRequirements.maxAmountRequired,
-        state: 'submitted',
-        key_id: req.keyId ?? null,
-      });
-
-      /**
- main
-       * Exact-once settlement: a repeated idempotency key replays the recorded
-       * response instead of touching the chain again. The key is client-supplied
-       * when present and derived from the request body otherwise.
-       */
-      const idemReq = {
-        get: name => req.headers[name.toLowerCase()],
-        body: req.body,
-      };
-      const replay = idempotency ? await idempotency.begin(idempotency.keyFor(idemReq)) : null;
-      if (replay?.replayed) {
-        handleRateLimit(reply, check);
-        return reply.code(replay.statusCode).send(replay.response);
-      }
-
-      /**
-       * Critical state transition (#116): the settle call moves funds and burns
-       * a sequence number, so identical concurrent requests across pod replicas
-       * must be serialized before the scheme is invoked. The lock key is the
-       * payment itself — two callers racing the same payment contend on the same
-       * key; different payments proceed in parallel.
-       */
-      const lockKey = distributedLock ? lockKeyFor(body.paymentPayload) : null;
-
-      try {
-        const settleOnce = async () => {
- feat/opentelemetry-tracing
-          const result = await tracedSchemeCall(
-            'settle',
-            body.paymentRequirements.network,
-            () => facilitator.settle(body.paymentPayload, body.paymentRequirements),
-            { 'tenant.id': req.keyId ?? 'open' },
-          );
-          await rateLimiter.recordSettle(
-            req,
-            result.success ? result.transactionFeeStroops || 0 : 0,
-          );
-
-          const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
-          const network = body.paymentRequirements.network;
-          const maxFee = config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000;
-          const feeCharged = result.success ? maxFee : 0;
-          await rateLimiter.recordSettle(req, feeCharged);
- main
-          handleRateLimit(reply, check);
-          if (result.success) {
-            // Settlement notification (#123): the event is written to the
-            // outbox in the SAME database transaction as the 'settled' state
-            // change, so a crash between settling and notifying cannot lose
-            // the notification — the outbox worker publishes it afterwards.
-            // Only when no durable outbox exists (in-memory store or degraded
-            // Postgres) do we fall back to the fire-and-forget webhook
-            // publish (#117), which is the pre-outbox behaviour.
-            const event = webhooks
-              ? {
-                  type: 'settlement.completed',
-                  transaction: result.transaction,
-                  network: result.network,
-                  payer: result.payer,
-                  payTo: body.paymentRequirements.payTo,
-                  amount: body.paymentRequirements.maxAmountRequired,
-                  asset: body.paymentRequirements.asset,
-                }
-              : null;
-
-            const enqueued = await settlementStore.settleAndEnqueue(
-              idempotencyKey,
-              { tx_hash: result.transaction, response: result },
-              event,
-            );
-
-            await processCataloging(req, body, reply, 'payment');
-
-            if (
-              !enqueued.atomicallyEnqueued &&
-              enqueued.event &&
-              webhooks &&
-              typeof webhooks.enqueue === 'function'
-            ) {
-              webhooks.enqueue(enqueued.event);
+          if (existingRecord.state === 'failed') {
+            const RETRYABLE = new Set([
+              'rate_limited',
+              'catalog_rate_limited',
+              'soroban_rpc_unreachable',
+              'lock_timeout',
+              'request_timeout',
+            ]);
+            if (!RETRYABLE.has(existingRecord.error_reason)) {
+              handleRateLimit(reply, check);
+              if (existingRecord.response) {
+                const respPayload =
+                  typeof existingRecord.response === 'string'
+                    ? JSON.parse(existingRecord.response)
+                    : existingRecord.response;
+                return reply.send(respPayload);
+              }
+              return reply.send({
+                success: false,
+                errorReason: existingRecord.error_reason,
+                errorMessage: existingRecord.error_message,
+                transaction: existingRecord.tx_hash || '',
+                network: existingRecord.network,
+              });
             }
-          } else {
-            await settlementStore.updateState(idempotencyKey, 'failed', {
-              tx_hash: result.transaction || null,
-              error_reason: result.errorReason || 'facilitator_error',
-              error_message: result.errorMessage || null,
-              response: result,
-            });
           }
-          if (idempotency && replay) {
-            await idempotency.complete(replay.key, 200, result);
-          }
+        }
 
-          // Settlements are THE auditable record: which authenticated caller moved
-          // money, and the transaction hash to reconstruct it by.
-          audit('settlement', {
-            actor: req.keyId ?? `ip:${req.ip}`,
-            outcome: result.success ? 'settled' : 'failed',
-            transaction: result.transaction || null,
-            network: result.network ?? body.paymentRequirements.network,
-            fee_stroops: result.success ? result.transactionFeeStroops || 0 : 0,
-            error_reason: result.errorReason ?? null,
-          });
-          return result;
+        await settlementStore.save({
+          idempotency_key: idempotencyKey,
+          network: body.paymentRequirements.network,
+          scheme: body.paymentRequirements.scheme,
+          payer: body.paymentPayload?.payer ?? null,
+          pay_to: body.paymentRequirements.payTo,
+          asset: body.paymentRequirements.asset,
+          amount: body.paymentRequirements.maxAmountRequired,
+          state: 'submitted',
+          key_id: req.keyId ?? null,
+        });
+
+        /**
+         * Exact-once settlement: a repeated idempotency key replays the recorded
+         * response instead of touching the chain again. The key is client-supplied
+         * when present and derived from the request body otherwise.
+         */
+        const idemReq = {
+          get: name => req.headers[name.toLowerCase()],
+          body: req.body,
         };
+        const replay = idempotency ? await idempotency.begin(idempotency.keyFor(idemReq)) : null;
+        if (replay?.replayed) {
+          handleRateLimit(reply, check);
+          return reply.code(replay.statusCode).send(replay.response);
+        }
 
-        const timeoutMs = config.requestTimeoutMs ?? 30_000;
-        let timeoutTimer;
-        const timeoutPromise = new Promise((_, reject) => {
-          timeoutTimer = setTimeout(() => {
-            const isSubmitted = requestState.getStore()?.submitted === true;
-            const err = new Error(
-              isSubmitted
-                ? 'settlement submitted to network but timed out waiting for confirmation'
-                : 'request timeout',
+        /**
+         * Critical state transition (#116): the settle call moves funds and burns
+         * a sequence number, so identical concurrent requests across pod replicas
+         * must be serialized before the scheme is invoked. The lock key is the
+         * payment itself — two callers racing the same payment contend on the same
+         * key; different payments proceed in parallel.
+         */
+        const lockKey = distributedLock ? lockKeyFor(body.paymentPayload) : null;
+
+        try {
+          const settleOnce = async () => {
+            const result = await tracedSchemeCall(
+              'settle',
+              body.paymentRequirements.network,
+              () => facilitator.settle(body.paymentPayload, body.paymentRequirements),
+              { 'tenant.id': req.keyId ?? 'open' },
             );
-            err.code = isSubmitted ? 'SUBMITTED_OUTCOME_UNKNOWN' : 'REQUEST_TIMEOUT';
-            reject(err);
-          }, timeoutMs);
-        });
+            const network = body.paymentRequirements.network;
+            const maxFee = config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000;
+            const feeCharged = result.success ? maxFee : 0;
+            await rateLimiter.recordSettle(req, feeCharged);
+            handleRateLimit(reply, check);
+            if (result.success) {
+              // Settlement notification (#123): the event is written to the
+              // outbox in the SAME database transaction as the 'settled' state
+              // change, so a crash between settling and notifying cannot lose
+              // the notification — the outbox worker publishes it afterwards.
+              // Only when no durable outbox exists (in-memory store or degraded
+              // Postgres) do we fall back to the fire-and-forget webhook
+              // publish (#117), which is the pre-outbox behaviour.
+              const event = webhooks
+                ? {
+                    type: 'settlement.completed',
+                    transaction: result.transaction,
+                    network: result.network,
+                    payer: result.payer,
+                    payTo: body.paymentRequirements.payTo,
+                    amount: body.paymentRequirements.maxAmountRequired,
+                    asset: body.paymentRequirements.asset,
+                  }
+                : null;
 
-        const resultPromise = distributedLock
-          ? distributedLock.withLock(lockKey, settleOnce)
-          : settleOnce();
+              const enqueued = await settlementStore.settleAndEnqueue(
+                idempotencyKey,
+                { tx_hash: result.transaction, response: result },
+                event,
+              );
 
-        const result = await Promise.race([resultPromise, timeoutPromise]).finally(() => {
-          clearTimeout(timeoutTimer);
-        });
-        return reply.send(result);
-      } catch (err) {
-        // SettleResponse requires `transaction` and `network` even on failure, so
-        // a client can attribute the failure without correlating out of band.
-        //
-        // A lock that never freed under healthy Redis gets its own code (#116),
-        // and an open RPC breaker gets its own code so a caller can tell "the
-        // chain is unreachable" from "your payment was rejected" (#105, #6).
-        const network = body?.paymentRequirements?.network ?? 'unknown';
-        const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
-        console.error(
-          `[/settle] Exception: route=/settle network=${network} scheme=${scheme} ` +
-            `error=${err instanceof Error ? err.message : String(err)} ` +
-            `stack=${err instanceof Error ? err.stack : 'no stack'}`,
-        );
+              await processCataloging(req, body, reply, 'payment');
 
-        let errorReason = 'facilitator_error';
-        if (err?.code === 'SUBMITTED_OUTCOME_UNKNOWN') {
-          errorReason = 'submitted_outcome_unknown';
-        } else if (err?.code === 'REQUEST_TIMEOUT') {
-          errorReason = 'request_timeout';
-        } else if (err instanceof Error && err.name === 'LockAcquireTimeoutError') {
-          errorReason = 'lock_timeout';
-        } else if (err?.code === 'RPC_BREAKER_OPEN') {
-          errorReason = 'soroban_rpc_unreachable';
-          audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'settle' });
-        } else if (err?.message?.includes('unregistered')) {
-          errorReason = 'unsupported_scheme_network';
+              if (
+                !enqueued.atomicallyEnqueued &&
+                enqueued.event &&
+                webhooks &&
+                typeof webhooks.enqueue === 'function'
+              ) {
+                webhooks.enqueue(enqueued.event);
+              }
+            } else {
+              await settlementStore.updateState(idempotencyKey, 'failed', {
+                tx_hash: result.transaction || null,
+                error_reason: result.errorReason || 'facilitator_error',
+                error_message: result.errorMessage || null,
+                response: result,
+              });
+            }
+            if (idempotency && replay) {
+              await idempotency.complete(replay.key, 200, result);
+            }
+
+            // Settlements are THE auditable record: which authenticated caller moved
+            // money, and the transaction hash to reconstruct it by.
+            audit('settlement', {
+              actor: req.keyId ?? `ip:${req.ip}`,
+              outcome: result.success ? 'settled' : 'failed',
+              transaction: result.transaction || null,
+              network: result.network ?? body.paymentRequirements.network,
+              fee_stroops: result.success ? result.transactionFeeStroops || 0 : 0,
+              error_reason: result.errorReason ?? null,
+            });
+            return result;
+          };
+
+          const timeoutMs = config.requestTimeoutMs ?? 30_000;
+          let timeoutTimer;
+          const timeoutPromise = new Promise((_, reject) => {
+            timeoutTimer = setTimeout(() => {
+              const isSubmitted = requestState.getStore()?.submitted === true;
+              const err = new Error(
+                isSubmitted
+                  ? 'settlement submitted to network but timed out waiting for confirmation'
+                  : 'request timeout',
+              );
+              err.code = isSubmitted ? 'SUBMITTED_OUTCOME_UNKNOWN' : 'REQUEST_TIMEOUT';
+              reject(err);
+            }, timeoutMs);
+          });
+
+          const resultPromise = distributedLock
+            ? distributedLock.withLock(lockKey, settleOnce)
+            : settleOnce();
+
+          const result = await Promise.race([resultPromise, timeoutPromise]).finally(() => {
+            clearTimeout(timeoutTimer);
+          });
+          return reply.send(result);
+        } catch (err) {
+          // SettleResponse requires `transaction` and `network` even on failure, so
+          // a client can attribute the failure without correlating out of band.
+          //
+          // A lock that never freed under healthy Redis gets its own code (#116),
+          // and an open RPC breaker gets its own code so a caller can tell "the
+          // chain is unreachable" from "your payment was rejected" (#105, #6).
+          const network = body?.paymentRequirements?.network ?? 'unknown';
+          const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
+          console.error(
+            `[/settle] Exception: route=/settle network=${network} scheme=${scheme} ` +
+              `error=${err instanceof Error ? err.message : String(err)} ` +
+              `stack=${err instanceof Error ? err.stack : 'no stack'}`,
+          );
+
+          let errorReason = 'facilitator_error';
+          if (err?.code === 'SUBMITTED_OUTCOME_UNKNOWN') {
+            errorReason = 'submitted_outcome_unknown';
+          } else if (err?.code === 'REQUEST_TIMEOUT') {
+            errorReason = 'request_timeout';
+          } else if (err instanceof Error && err.name === 'LockAcquireTimeoutError') {
+            errorReason = 'lock_timeout';
+          } else if (err?.code === 'RPC_BREAKER_OPEN') {
+            errorReason = 'soroban_rpc_unreachable';
+            audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'settle' });
+          } else if (err?.message?.includes('unregistered')) {
+            errorReason = 'unsupported_scheme_network';
+          }
+
+          let transaction = '';
+          if (
+            body.paymentPayload?.transaction &&
+            typeof body.paymentPayload.transaction === 'string'
+          ) {
+            transaction = body.paymentPayload.transaction;
+          }
+
+          const targetState = errorReason === 'submitted_outcome_unknown' ? 'unknown' : 'failed';
+          await settlementStore.updateState(idempotencyKey, targetState, {
+            tx_hash: transaction,
+            error_reason: errorReason,
+            error_message: err instanceof Error ? err.message : String(err),
+          });
+
+          return reply.send({
+            success: false,
+            errorReason,
+            errorMessage: err instanceof Error ? err.message : String(err),
+            transaction,
+            network: req.body?.paymentRequirements?.network ?? '',
+          });
         }
-
-        let transaction = '';
-        if (
-          body.paymentPayload?.transaction &&
-          typeof body.paymentPayload.transaction === 'string'
-        ) {
-          transaction = body.paymentPayload.transaction;
-        }
-
-        const targetState = errorReason === 'submitted_outcome_unknown' ? 'unknown' : 'failed';
-        await settlementStore.updateState(idempotencyKey, targetState, {
-          tx_hash: transaction,
-          error_reason: errorReason,
-          error_message: err instanceof Error ? err.message : String(err),
-        });
-
-        return reply.send({
-          success: false,
-          errorReason,
-          errorMessage: err instanceof Error ? err.message : String(err),
-          transaction,
-          network: req.body?.paymentRequirements?.network ?? '',
-        });
-      }
-    });
+      });
     },
   );
 
@@ -1212,7 +1119,6 @@ main
     async (req, reply) => {
       const body = readDiscoveryBody(req, reply);
       if (!body) return reply;
-      annotateSpan({ 'tenant.id': req.keyId ?? 'open', 'http.route': '/discovery/resources' });
 
       const check = await rateLimiter.checkCatalog(req);
       if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/resources', check);
@@ -1257,6 +1163,7 @@ main
    * the catalog implementation is acceptable if documented.
    */
   app.get('/discovery/resources', { onRequest: cors('public') }, async (req, reply) => {
+    annotateSpan({ 'tenant.id': req.keyId ?? 'open', 'http.route': '/discovery/resources' });
     const check = await rateLimiter.checkCatalogRead(req);
     if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/resources', check);
 
@@ -1316,6 +1223,7 @@ main
    * Pagination is clamped at the API boundary before passing to the catalog.
    */
   app.get('/discovery/search', { onRequest: cors('public') }, async (req, reply) => {
+    annotateSpan({ 'tenant.id': req.keyId ?? 'open', 'http.route': '/discovery/search' });
     const check = await rateLimiter.checkCatalogRead(req);
     if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/search', check);
 

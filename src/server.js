@@ -7,7 +7,6 @@
  * this file is only the wiring a test has no use for.
  */
 import dotenv from 'dotenv';
-import { initTracing } from './tracing.js';
 import { resolveConfig } from './config.js';
 import { buildFacilitator } from './facilitator.js';
 import { installHorizonClient } from './horizon-client.js';
@@ -21,6 +20,7 @@ import { buildIdempotencyStore } from './idempotency.js';
 import { MemoryCatalogStore } from './catalog/memory.js';
 import { createWebhookDispatcher } from './webhooks/dispatcher.js';
 import { FailoverHealthChecker } from './failover-health.js';
+import { initTracing } from './tracing.js';
 import { createApp } from './app.js';
 
 // A .env file is a development convenience, not a deployment mechanism — in
@@ -31,12 +31,11 @@ if (process.env.NODE_ENV !== 'production') {
   dotenv.config({ quiet: true });
 }
 
-// Must run BEFORE installHorizonClient / installRpcRetry so the undici
-// instrumentation patches the npm `undici` client they dial through, and before
-// the http server starts so the inbound server span + traceparent extraction
-// are live for every request. No-op (returns null) when TRACING_ENABLED=false.
+// OpenTelemetry tracing: must run BEFORE installHorizonClient /
+// installRpcRetry so the undici instrumentation patches the npm `undici` client they
+// dial through, and before the http server starts so inbound span + traceparent
+// extraction are live for every request. No-op (returns null) when TRACING_ENABLED=false.
 const otel = initTracing();
-
 // Must run BEFORE installRpcRetry: the retry wrapper composes on top of
 // whatever fetch is global when it installs. Innermost first — pooled sockets
 // and the per-origin breaker (#120) sit under connection-level retries and the
@@ -235,33 +234,8 @@ app.listen({ port: config.port, host: '0.0.0.0' }, () => {
  */
 async function shutdown(signal) {
   console.log(`${signal} received — draining`);
- feat/opentelemetry-tracing
- feat/opentelemetry-tracing
- feat/opentelemetry-tracing
-
- main
-  try {
-    await app.close();
-    await webhooks.stop().catch(() => {});
-    await distributedLock?.quit().catch(() => {});
- feat/opentelemetry-tracing
-    horizon.restore();
-    await otel?.shutdown().catch(() => {});
-  } finally {
-    process.exit(0);
-
-
-    await crdtStore?.close().catch(() => {});
-    failoverHealth?.stop();
-    horizon.restore();
-  } finally {
-    process.exit(0);
- main
-
- main
   if (app.readiness && typeof app.readiness.setShuttingDown === 'function') {
     app.readiness.setShuttingDown();
-main
   }
 
   const graceMs = config.shutdownGraceMs ?? 15_000;
@@ -273,6 +247,7 @@ main
       await outboxWorker?.stop();
       await vaultDatabase?.stop();
       await app.close();
+      await otel?.shutdown().catch(() => {});
       await webhooks.stop().catch(() => {});
       await distributedLock?.quit()?.catch(() => {});
       await crdtStore?.close().catch(() => {});
