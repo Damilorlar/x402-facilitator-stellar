@@ -22,6 +22,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      db-replica:
+        condition: service_healthy
       redis:
         condition: service_healthy
       redis-node-1:
@@ -112,6 +114,41 @@ services:
       timeout: 5s
       retries: 5
 
+  # Streaming read replica (#121). Production should run >= 2 across failure
+  # domains; one node is the correct shape for local composition. It boots by
+  # taking a pg_basebackup of the primary, then follows the write-ahead log
+  # continuously. Reads from this node are intentionally replicated outside the
+  # primary's transaction lifetime, so read-after-write consistency is handled
+  # at the application layer (see src/store/postgres.js).
+  db-replica:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - PGPASSWORD=postgres
+    ports:
+      - '5433:5432'
+    command:
+      - bash
+      - -ec
+      - |
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data
+          pg_basebackup -h db -U postgres -D /var/lib/postgresql/data -Fp -R -X stream
+        fi
+        exec docker-entrypoint.sh postgres
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
   postgres_data:
+  postgres_replica_data:
   kafka_data:

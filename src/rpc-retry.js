@@ -38,9 +38,9 @@
  * That is safe here for two reasons: a connection-level failure means the
  * request most likely never arrived, and a Soroban transaction is identified by
  * its hash, so a genuine duplicate is rejected as such by the network rather
- * than settling twice. It is not a substitute for idempotency keys in a
- * production facilitator, and should be revisited alongside the durable
- * settlement-status store this spike does not have.
+ * than settling twice. At the HTTP level, issue #10 introduces durable
+ * idempotency keys (`settlements` table) to deduplicate incoming requests and
+ * record status across restarts.
  *
  * ON sendTransaction AND THE BREAKER. A settle whose broadcast has already
  * gone out must never be reported as failed because a breaker tripped
@@ -52,6 +52,7 @@
  */
 
 import { createRequire } from 'node:module';
+import { requestState } from './request-state.js';
 
 const require = createRequire(import.meta.url);
 
@@ -110,6 +111,9 @@ function isSendTransaction(input, init) {
  *   letting a single probe through (half-open)
  * @param {(msg: string) => void} [options.log]
  * @param {(msg: string) => void} [options.onStateChange]
+ * @param {(info: { code: string|undefined, attempt: number, host: string, url: string }) => void} [options.onRetry]
+ *   structured hook for observability — feeds x402_rpc_retries_total from the
+ *   metrics layer rather than parsing a log string.
  * @returns {{ getBreakerStates: Function }} readable breaker state, surfaced
  *   on the readiness endpoint (issue #100)
  */
@@ -120,6 +124,7 @@ export function installRpcRetry({
   cooldownMs = Number(process.env.RPC_BREAKER_COOLDOWN_MS ?? 30_000),
   log = () => {},
   onStateChange = () => {},
+  onRetry = () => {},
   forceIpv4 = process.env.RPC_FORCE_IPV4 !== 'false',
 } = {}) {
   const builtinFetch = globalThis.fetch;
@@ -202,6 +207,12 @@ export function installRpcRetry({
     // breaker. A settle whose broadcast went out must ride out a trip that
     // happens between its own retries.
     const protectedCall = isSendTransaction(input, init);
+    if (protectedCall) {
+      const store = requestState.getStore();
+      if (store) {
+        store.submitted = true;
+      }
+    }
 
     if (!protectedCall && !gate(b, host)) {
       throw new RpcBreakerOpenError(host);
@@ -223,6 +234,7 @@ export function installRpcRetry({
         recordFailure(b, host);
         const url = typeof input === 'string' ? input : (input?.url ?? '');
         log(`rpc ${code} on ${url} — retry ${attempt}/${attempts - 1}`);
+        onRetry({ code, attempt, host, url });
         await new Promise(r => setTimeout(r, baseDelayMs * attempt));
       }
     }
