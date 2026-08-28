@@ -690,7 +690,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           invalidReason = 'request_timeout';
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           invalidReason = 'soroban_rpc_unreachable';
-        } else if (err?.message?.includes('unregistered') || err?.message?.includes('scheme')) {
+        } else if (err?.message?.includes('unregistered')) {
           invalidReason = 'unsupported_scheme_network';
         }
         if (invalidReason !== 'facilitator_error') {
@@ -829,26 +829,40 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           await rateLimiter.recordSettle(req, feeCharged);
           handleRateLimit(reply, check);
           if (result.success) {
-            await settlementStore.updateState(idempotencyKey, 'settled', {
-              tx_hash: result.transaction,
-              response: result,
-            });
+            // Settlement notification (#123): the event is written to the
+            // outbox in the SAME database transaction as the 'settled' state
+            // change, so a crash between settling and notifying cannot lose
+            // the notification — the outbox worker publishes it afterwards.
+            // Only when no durable outbox exists (in-memory store or degraded
+            // Postgres) do we fall back to the fire-and-forget webhook
+            // publish (#117), which is the pre-outbox behaviour.
+            const event = webhooks
+              ? {
+                  type: 'settlement.completed',
+                  transaction: result.transaction,
+                  network: result.network,
+                  payer: result.payer,
+                  payTo: body.paymentRequirements.payTo,
+                  amount: body.paymentRequirements.maxAmountRequired,
+                  asset: body.paymentRequirements.asset,
+                }
+              : null;
+
+            const enqueued = await settlementStore.settleAndEnqueue(
+              idempotencyKey,
+              { tx_hash: result.transaction, response: result },
+              event,
+            );
 
             await processCataloging(req, body, reply, 'payment');
 
-            // Webhook notification (#117): published, not delivered inline.
-            // A slow receiving server must never sit inside this HTTP
-            // request's lifecycle — see src/webhooks/.
-            if (webhooks && typeof webhooks.enqueue === 'function') {
-              webhooks.enqueue({
-                type: 'settlement.completed',
-                transaction: result.transaction,
-                network: result.network,
-                payer: result.payer,
-                payTo: body.paymentRequirements.payTo,
-                amount: body.paymentRequirements.maxAmountRequired,
-                asset: body.paymentRequirements.asset,
-              });
+            if (
+              !enqueued.atomicallyEnqueued &&
+              enqueued.event &&
+              webhooks &&
+              typeof webhooks.enqueue === 'function'
+            ) {
+              webhooks.enqueue(enqueued.event);
             }
           } else {
             await settlementStore.updateState(idempotencyKey, 'failed', {
@@ -923,7 +937,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         } else if (err?.code === 'RPC_BREAKER_OPEN') {
           errorReason = 'soroban_rpc_unreachable';
           audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'settle' });
-        } else if (err?.message?.includes('unregistered') || err?.message?.includes('scheme')) {
+        } else if (err?.message?.includes('unregistered')) {
           errorReason = 'unsupported_scheme_network';
         }
 
@@ -970,7 +984,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
       }
 
-      if (req.keyId && record.key_id && record.key_id !== req.keyId) {
+      // Key ids are case-insensitive by design (normalized to uppercase at
+      // auth, see requireApiKey), so compare against the normalized form.
+      if (req.keyId && record.key_id && record.key_id.toUpperCase() !== req.keyId) {
         return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
       }
 
@@ -997,7 +1013,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
       }
 
-      if (req.keyId && record.key_id && record.key_id !== req.keyId) {
+      // Key ids are case-insensitive by design (normalized to uppercase at
+      // auth, see requireApiKey), so compare against the normalized form.
+      if (req.keyId && record.key_id && record.key_id.toUpperCase() !== req.keyId) {
         return reply.code(404).send({ error: 'not_found', message: 'Settlement record not found' });
       }
 
@@ -1048,12 +1066,28 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         });
         return reply.send({ ok: true, resource: entry, softDrops: validation.softDrops });
       } catch (err) {
-        return reply.code(400).send({ error: 'catalog_error', reason: err.message });
+        console.error(`[Catalog] manual upsert error: ${err.message}`);
+        return reply.code(400).send({ error: 'catalog_error', reason: 'catalog_error' });
       }
     },
   );
 
+  /**
+   * GET /discovery/resources — public catalog read.
+   *
+   * Public reads are intentional: a discovery catalog that agents cannot browse
+   * is not much of a catalog. The endpoint is unauthenticated but rate-limited
+   * to prevent abuse. Reads use a separate bucket from writes (catalogReadRpm)
+   * because they have very different cost profiles.
+   *
+   * Pagination is clamped at the API boundary before passing to the catalog.
+   * The catalog may assume validated input; duplicated defensive clamping in
+   * the catalog implementation is acceptable if documented.
+   */
   app.get('/discovery/resources', { onRequest: cors('public') }, async (req, reply) => {
+    const check = await rateLimiter.checkCatalogRead(req);
+    if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/resources', check);
+
     let extensions;
     if (req.query.extensions) {
       extensions = Array.isArray(req.query.extensions)
@@ -1061,39 +1095,58 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         : req.query.extensions.split(',');
     }
 
+    // Clamp pagination at the boundary before calling catalog
+    let parsedLimit = parseInt(req.query.limit, 10);
+    if (isNaN(parsedLimit)) parsedLimit = 20;
+    const clampedLimit = Math.min(Math.max(1, parsedLimit), 100);
+
+    let parsedOffset = parseInt(req.query.offset, 10);
+    if (isNaN(parsedOffset)) parsedOffset = 0;
+    const clampedOffset = Math.max(0, parsedOffset);
+
     const params = {
       type: req.query.type,
       payTo: req.query.payTo,
       scheme: req.query.scheme,
       network: req.query.network,
       extensions,
-      limit: req.query.limit,
-      offset: req.query.offset,
+      limit: clampedLimit,
+      offset: clampedOffset,
     };
 
     try {
       const result = await catalog.listResources(params);
-      let parsedLimit = parseInt(params.limit, 10);
-      if (isNaN(parsedLimit)) parsedLimit = 20;
-
-      let parsedOffset = parseInt(params.offset, 10);
-      if (isNaN(parsedOffset)) parsedOffset = 0;
+      await rateLimiter.recordCatalogRead(req);
+      handleRateLimit(reply, check);
 
       return reply.send({
         x402Version: 2,
         items: result.items,
         pagination: {
-          limit: Math.min(Math.max(1, parsedLimit), 100),
-          offset: Math.max(0, parsedOffset),
+          limit: clampedLimit,
+          offset: clampedOffset,
           total: result.total,
         },
       });
     } catch (err) {
-      return reply.code(500).send({ error: 'internal_error', message: err.message });
+      console.error(`[Discovery] listResources error: ${err.message}`);
+      return reply.code(500).send({ error: 'internal_error', reason: 'internal_error' });
     }
   });
 
+  /**
+   * GET /discovery/search — public catalog search.
+   *
+   * Public search is intentional for the same reason as listResources. This
+   * endpoint is more expensive than listResources (it delegates to embeddings.js),
+   * so it shares the catalog_read bucket but is weighted accordingly in config.
+   *
+   * Pagination is clamped at the API boundary before passing to the catalog.
+   */
   app.get('/discovery/search', { onRequest: cors('public') }, async (req, reply) => {
+    const check = await rateLimiter.checkCatalogRead(req);
+    if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/search', check);
+
     if (!req.query.query) {
       return reply.code(400).send({ error: 'invalid_request', reason: 'query is required' });
     }
@@ -1105,6 +1158,11 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         : req.query.extensions.split(',');
     }
 
+    // Clamp pagination at the boundary before calling catalog
+    let parsedLimit = parseInt(req.query.limit, 10);
+    if (isNaN(parsedLimit)) parsedLimit = 20;
+    const clampedLimit = Math.min(Math.max(1, parsedLimit), 100);
+
     const params = {
       query: req.query.query,
       type: req.query.type,
@@ -1112,12 +1170,15 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       scheme: req.query.scheme,
       network: req.query.network,
       extensions,
-      limit: req.query.limit,
+      limit: clampedLimit,
       cursor: req.query.cursor,
     };
 
     try {
       const result = await catalog.search(params);
+      await rateLimiter.recordCatalogRead(req);
+      handleRateLimit(reply, check);
+
       return reply.send({
         x402Version: 2,
         resources: result.resources,
@@ -1125,7 +1186,8 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         pagination: result.pagination,
       });
     } catch (err) {
-      return reply.code(500).send({ error: 'internal_error', message: err.message });
+      console.error(`[Discovery] search error: ${err.message}`);
+      return reply.code(500).send({ error: 'internal_error', reason: 'internal_error' });
     }
   });
 

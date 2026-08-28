@@ -201,6 +201,23 @@ export class RateLimiter {
     await this._increment(ownerId, 'catalog', 60, 1);
   }
 
+  /**
+   * Catalogue reads are metered separately from writes with their own bucket.
+   * Reads are cheaper than writes but still bounded to prevent abuse.
+   */
+  async checkCatalogRead(req) {
+    const ownerId = req.keyId || req.ip;
+    const limits = this._getKeyConfig(req.keyId);
+    const res = await this._check(ownerId, 'catalog_read', 60, limits.catalogReadRpm ?? 60);
+    if (!res.allowed && !res.reason) res.reason = 'catalog_read_rate_limited';
+    return res;
+  }
+
+  async recordCatalogRead(req) {
+    const ownerId = req.keyId || req.ip;
+    await this._increment(ownerId, 'catalog_read', 60, 1);
+  }
+
   async getUsage(keyId) {
     const ownerId = keyId; // IP usage is not exposed via GET /usage, only key usage
     const limits = this._getKeyConfig(keyId);
