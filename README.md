@@ -161,6 +161,14 @@ ALICE_SECRET=$(stellar keys show alice) npm run e2e
 The X402 Facilitator handles sensitive transaction and search query data. Our approach is to collect only what is necessary, and to aggressively purge it according to strict retention policies.
 For detailed information, see our [Privacy Policy](docs/PRIVACY.md).
 
+### Observability
+
+The transport emits one structured JSON line per request to stdout and exposes
+Prometheus metrics on `GET /metrics`. Configure `LOG_LEVEL` (verbosity) and
+`METRICS_PORT` (bind metrics to a separate, unauthenticated port) via the
+environment — see `.env.example` and [Operations](docs/OPERATIONS.md)
+for the log fields and the alert to set on each metric.
+
 ## Conformance
 
 Acceptance is tested at the wire level with stock SDK code, not by reading a claim. What
