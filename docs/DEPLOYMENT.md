@@ -189,6 +189,42 @@ store fails CLOSED — checks refuse with reason `rate_limit_store_unavailable`
 ceiling is spent, and answering "allowed" would mean unlimited sponsored spend
 during an outage.
 
+## CQRS Read Replica (Issue #121)
+
+Settlement status reads and new settlement submissions currently share one
+Postgres pool. Historical status queries (`GET /settlements/:key`) can block the
+primary event loop and add latency to the write path that actually moves funds.
+#121 separates the two concerns:
+
+- **Writes stay on the primary.** `save`, `updateState`, and the idempotent
+  upsert that backs `/settle` hit the `DATABASE_URL` pool only.
+- **Reads go to the replica.** Status reads and the background reconciliation
+  sweep hit the `DATABASE_URL_REPLICA` pool. Reads no longer contend with
+  writes, so read throughput scales independently (replica pools open more
+  connections: `max: 20` vs `max: 5` on the primary).
+
+To enable it, provision a streaming replica of the primary (PostgreSQL native
+replication via `pg_basebackup` + WAL follow — `docker-compose.yml` ships a
+single-node `db-replica` that is the correct shape for local composition; run
+≥ 2 nodes across failure domains in production), then set
+`DATABASE_URL_REPLICA`. The primary's schema propagates to the replica via
+replication; no separate migration is needed on the replica.
+
+**Read-after-write consistency** (acceptance criterion: settle then immediately
+GET the status): Postgres streaming replication is asynchronous, so a row can
+be briefly invisible to the replica. The store handles this in three layers:
+
+1. A row this process just wrote is always served from that process's in-memory
+   copy — a replica read never touches our own fresh write.
+2. A status read that the replica hasn't propagated yet retries (up to
+   `SETTLEMENT_REPLICA_LAG_MS`, default `1000` ms).
+3. If the replica still can't see the row, the read falls back to the primary
+   before deciding it's a genuine miss — so a `404` is only returned once
+   replication is confirmed to have drained.
+
+Unset `DATABASE_URL_REPLICA` for the pre-#121 behaviour (single pool, reads and
+writes on the primary) — this is the zero-config default and always correct.
+
 ## Health Endpoints and Probes
 
 - `GET /healthz` — liveness. Always `{ ok: true }` while the process runs; no
