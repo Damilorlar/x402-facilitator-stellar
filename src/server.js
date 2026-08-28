@@ -279,18 +279,16 @@ async function shutdown(signal) {
       await outboxWorker?.stop();
       await vaultDatabase?.stop();
       await app.close();
-      await new Promise(resolve => (metricsServerRef ? metricsServerRef.close(resolve) : resolve()));
+      await new Promise(resolve =>
+        metricsServerRef ? metricsServerRef.close(resolve) : resolve(),
+      );
       await webhooks.stop().catch(() => {});
       await distributedLock?.quit()?.catch(() => {});
       await crdtStore?.close().catch(() => {});
 
       failoverHealth?.stop();
 
-
-      failoverHealth?.stop();
-
       await rateLimiter?.close?.().catch(() => {});
- main
       horizon.restore();
     } catch (err) {
       console.error(`Error during shutdown: ${err.message}`);
