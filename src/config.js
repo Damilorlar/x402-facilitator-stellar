@@ -221,6 +221,19 @@ export function resolveConfig(env = process.env) {
     port: Number(env.PORT ?? 3402),
 
     /**
+     * Diagnostic log verbosity. Parsed leniently by src/log.js — an unknown
+     * value falls back to 'info' so a typo never silently hides an outage.
+     */
+    logLevel: env.LOG_LEVEL ?? 'info',
+
+    /**
+     * When set, Prometheus metrics are served on this port (unauthenticated)
+     * instead of on the public listener, so they need not be exposed publicly.
+     * Unset means GET /metrics is served on PORT. See docs/OPERATIONS.md.
+     */
+    metricsPort: env.METRICS_PORT ? Number(env.METRICS_PORT) : null,
+
+    /**
      * Deployment environment. Unset in the Docker image by default; only used
      * here to decide whether a local .env file is loaded and whether HSTS is
      * sent. Never gate error-detail behaviour on it — see app.js.

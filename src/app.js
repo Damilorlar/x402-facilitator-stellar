@@ -39,7 +39,9 @@ import { validateForCatalog } from './catalog/validation.js';
 import { createAuditLogger } from './audit.js';
 import { createReadinessChecker } from './readiness.js';
 import { validatePaymentBody, validatePaymentFields } from './request-validation.js';
-import { requestLogger } from './logger.js';
+import { createRequestLog } from './log.js';
+import { createMetrics } from './metrics.js';
+
 import { lockKeyFor } from './distributed-lock.js';
 import { requestState } from './request-state.js';
 import { signerMetrics } from './metrics.js';
@@ -169,6 +171,26 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     failoverHealth = null,
     settlementStore = extras.settlementStore ?? buildSettlementStore(config),
   } = extras;
+
+  // Observability collaborators. Both are injectable so tests can capture the
+  // structured log line and inspect the metrics registry without a stdout scraper
+  // or a listener; in production server.js supplies real ones (and binds the
+  // metrics port when METRICS_PORT is set).
+  const logger = extras.logger ?? createRequestLog({ level: config.logLevel ?? 'info' });
+  const metrics = extras.metrics ?? createMetrics();
+  const signers = extras.signers ?? {};
+
+  // Seed the signer-inflight series at zero for every configured signer so the
+  // gauge exists before the pool lands (#9). The settle path flips it to one
+  // while a settlement is in flight.
+  for (const [network, signer] of Object.entries(signers)) {
+    if (signer) metrics.setSignerInflight({ network, signer, value: 0 });
+  }
+
+  // Whether /metrics is served on this (public) listener. When METRICS_PORT is
+  // set, server.js runs a separate listener for it and passes serveMetrics:false.
+  const serveMetrics = extras.serveMetrics !== false;
+
   const app = Fastify({
     // Client IP resolution. Unset leaves Fastify's default (off), correct where
     // the port is published directly — local development and docker-compose.
@@ -178,9 +200,8 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
 
     bodyLimit: BODY_LIMIT_BYTES,
 
-    // The transport logs one structured line per request via requestLogger()
-    // below, redacted through logger.js; Fastify's own pino logging stays off
-    // so there is exactly one choke point for what hits the log.
+    // Fastify's own pino logging stays off so there is exactly one choke point
+    // for what hits the log: the structured line emitted by the hooks below.
     logger: false,
 
     // AJV options: strict bodies are rejected, never silently coerced or
@@ -197,26 +218,74 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
   });
 
   /**
-   * Request logging (#78/#86 lineage): one redacted line per request. The
-   * middleware from logger.js speaks the Node req/res pair; Fastify exposes
-   * exactly that as request.raw / reply.raw, so the same redaction choke point
-   * serves both frameworks unchanged.
+   * In-flight request tracking for graceful shutdown (#248) combined with
+   * request correlation + structured logging (#7).
    */
-  const logRequest = requestLogger();
   let activeRequestCount = 0;
   app.decorate('getInFlightCount', () => activeRequestCount);
 
   app.addHook('onRequest', (req, reply, done) => {
     activeRequestCount++;
-    logRequest(req.raw, reply.raw, () => {});
+    const span = logger.begin(req);
+    req.span = span;
+    reply.header('X-Request-Id', span.requestId);
+    // Async-local request state for the shutdown drain (#248).
     requestState.run({ submitted: false }, () => {
-      done();
+      done?.();
     });
   });
 
-  app.addHook('onResponse', (_req, _reply, done) => {
+  /**
+   * Emits the single structured line per request and records metrics, after the
+   * response is on its way. Handlers populate span fields (network, scheme,
+   * keyId, outcome, reason, txHash, settleOutcome, feeStroops); anything they
+   * left unset is derived from the status code so every request still yields one
+   * complete line.
+   *
+   * Operational endpoints (/metrics, /healthz, /health/ready) are logged but
+   * excluded from x402_requests_total so the payment-request counters stay
+   * semantically about payments.
+   */
+  const OPERATIONAL_ROUTES = new Set(['/metrics', '/healthz', '/health/ready']);
+  app.addHook('onResponse', (req, reply, done) => {
     activeRequestCount = Math.max(0, activeRequestCount - 1);
-    done();
+    const span = req.span;
+    if (!span) return done?.();
+
+    const status = reply.statusCode;
+    const outcome = span.outcome ?? (status >= 500 ? 'error' : status >= 400 ? 'rejected' : 'ok');
+    const reason =
+      span.reason ?? (status >= 500 ? 'server_error' : status >= 400 ? 'client_error' : 'none');
+
+    logger.finish(span, { outcome, reason });
+
+    if (!OPERATIONAL_ROUTES.has(span.route)) {
+      metrics.incRequests({
+        route: span.route,
+        network: span.network ?? 'unknown',
+        outcome,
+        reason: span.reason ?? reason,
+      });
+      metrics.observeRequestDuration({
+        route: span.route,
+        network: span.network ?? 'unknown',
+        durationSeconds: (Date.now() - span.startedAt) / 1000,
+      });
+      if (span.route === '/settle' && span.settleOutcome) {
+        metrics.incSettlements({
+          network: span.network ?? 'unknown',
+          outcome: span.settleOutcome,
+        });
+        if (span.settleOutcome === 'settled' && typeof span.feeStroops === 'number') {
+          metrics.observeSettlementFee({
+            network: span.network ?? 'unknown',
+            feeStroops: span.feeStroops,
+          });
+        }
+      }
+    }
+
+    done?.();
   });
 
   const audit = extras.audit ?? createAuditLogger();
@@ -493,6 +562,9 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         presentedHash.length === apiKey.hash.length &&
         crypto.timingSafeEqual(presentedHash, apiKey.hash)
       ) {
+        // For the structured request log (keyId from #5).
+        if (req.span) req.span.keyId = apiKey.id;
+
         req.keyId = apiKey.id.toUpperCase();
         return;
       }
@@ -635,11 +707,6 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
 
   app.get('/healthz', async () => ({ ok: true }));
 
-  app.get('/metrics', async (_req, reply) => {
-    reply.header('content-type', 'text/plain; version=0.0.4; charset=utf-8');
-    return reply.send(signerMetrics.toPrometheusText());
-  });
-
   /**
    * GET /readyz — the readiness probe (#100, #8).
    *
@@ -685,6 +752,26 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
     return rateLimiter.getUsage(req.keyId);
   });
 
+  /**
+   * GET /metrics — Prometheus exposition format (unauthenticated).
+   *
+   * Served on this listener only when METRICS_PORT is unset; server.js otherwise
+   * runs it on a separate, unauthenticated port so it is never on the public
+   * surface. The content type carries the Prometheus version marker so scrapers
+   * accept it without probing.
+   */
+  if (serveMetrics) {
+    app.get('/metrics', async (_req, reply) => {
+      reply.header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+      return reply.send(metrics.render() + signerMetrics.toPrometheusText());
+    });
+  }
+
+  app.get('/usage', { preHandler: requireApiKeyStrict }, async req =>
+    rateLimiter.getUsage(req.keyId),
+  );
+
+
   app.post(
     '/verify',
     {
@@ -704,6 +791,29 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           await rateLimiter.recordVerify(req);
           handleRateLimit(reply, check);
 
+      const check = await rateLimiter.checkVerify(req);
+      if (!check.allowed) return rejectRateLimited(req, reply, '/verify', check);
+
+      const body = readPaymentBody(req, reply);
+      if (!body) return reply;
+      if (req.span) {
+        req.span.network = body.paymentRequirements.network;
+        req.span.scheme = body.paymentRequirements.scheme;
+      }
+      try {
+        await rateLimiter.recordVerify(req);
+        handleRateLimit(reply, check);
+        const timeoutMs = config.requestTimeoutMs ?? 30_000;
+        let timeoutTimer;
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            const err = new Error('request timeout');
+            err.code = 'REQUEST_TIMEOUT';
+            reject(err);
+          }, timeoutMs);
+        });
+
+
           const timeoutMs = config.requestTimeoutMs ?? 30_000;
           let timeoutTimer;
           const timeoutPromise = new Promise((_, reject) => {
@@ -713,6 +823,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
               reject(err);
             }, timeoutMs);
           });
+
 
           const verifyPromise = tracedSchemeCall(
             'verify',
@@ -725,6 +836,57 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           });
 
           audit('verification', {
+
+        if (req.span) {
+          req.span.outcome = result.isValid ? 'ok' : 'rejected';
+          req.span.reason = result.isValid ? 'none' : (result.invalidReason ?? 'invalid');
+        }
+        audit('verification', {
+          actor: req.keyId ?? `ip:${req.ip}`,
+          outcome: result.isValid ? 'valid' : 'invalid',
+          invalid_reason: result.invalidReason ?? null,
+          network: body.paymentRequirements.network,
+        });
+        if (result.isValid) {
+          await processCataloging(req, body, reply, 'payment');
+        }
+        return reply.send(result);
+      } catch (err) {
+        // An exception must not become a 500 with an empty body: to a client that
+        // is indistinguishable from the service being down, and it carries no
+        // reason code. Shape it like a verification failure instead.
+        //
+        // Note ExactStellarScheme already absorbs its own internal exceptions and
+        // returns invalidReason "unexpected_verify_error" rather than throwing, so
+        // this path only catches failures above the scheme — an unregistered
+        // scheme/network pair, for instance. A distinct code keeps the two
+        // distinguishable to a client.
+        //
+        // An open RPC breaker gets its own code so a caller can tell "the chain
+        // is unreachable" from "your payment was rejected" (#105, #6).
+        const network = body?.paymentRequirements?.network ?? 'unknown';
+        const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
+        console.error(
+          `[/verify] Exception: route=/verify network=${network} scheme=${scheme} ` +
+            `error=${err instanceof Error ? err.message : String(err)} ` +
+            `stack=${err instanceof Error ? err.stack : 'no stack'}`,
+        );
+
+        let invalidReason = 'facilitator_error';
+        if (err?.code === 'REQUEST_TIMEOUT') {
+          invalidReason = 'request_timeout';
+        } else if (err?.code === 'RPC_BREAKER_OPEN') {
+          invalidReason = 'soroban_rpc_unreachable';
+        } else if (err?.message?.includes('unregistered')) {
+          invalidReason = 'unsupported_scheme_network';
+        }
+        if (req.span) {
+          req.span.outcome = 'error';
+          req.span.reason = invalidReason;
+        }
+        if (invalidReason !== 'facilitator_error') {
+          audit('rpc_unreachable', {
+
             actor: req.keyId ?? `ip:${req.ip}`,
             outcome: result.isValid ? 'valid' : 'invalid',
             invalid_reason: result.invalidReason ?? null,
@@ -789,6 +951,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
       attachValidation: true,
     },
     async (req, reply) => {
+
       return withRequestSpan(`HTTP ${req.method} /settle`, req, async () => {
         const body = readPaymentBody(req, reply, 'settle');
         if (!body) return reply;
@@ -796,6 +959,19 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
         const network = body.paymentRequirements.network;
         const check = await rateLimiter.checkSettle(req, network);
         if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
+
+      const body = readPaymentBody(req, reply, 'settle');
+      if (!body) return reply;
+      const network = body.paymentRequirements.network;
+      const signer = signers[network] ?? null;
+      if (req.span) {
+        req.span.network = network;
+        req.span.scheme = body.paymentRequirements.scheme;
+      }
+
+      const check = await rateLimiter.checkSettle(req, network);
+      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
+
 
         const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
         const existingRecord = await settlementStore.get(idempotencyKey);
@@ -867,6 +1043,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
           state: 'submitted',
           key_id: req.keyId ?? null,
         });
+
 
         /**
          * Exact-once settlement: a repeated idempotency key replays the recorded
@@ -985,6 +1162,122 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
             ? distributedLock.withLock(lockKey, settleOnce)
             : settleOnce();
 
+      try {
+        const settleOnce = async () => {
+          // Sequence-contention signal (#9): this signer is now mid-settlement.
+          if (signer) metrics.setSignerInflight({ network, signer, value: 1 });
+          try {
+            const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
+            // The fee ceiling (feeSpd) is reserved against the sponsored max, so
+            // the rate limiter is told the worst-case fee per settlement.
+            const sponsoredFee = result.success
+              ? (config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000)
+              : 0;
+            // The metrics/audit record the fee actually paid by this settlement.
+            const actualFee = result.success ? result.transactionFeeStroops || 0 : 0;
+            await rateLimiter.recordSettle(req, sponsoredFee);
+            if (req.span) {
+              req.span.settleOutcome = result.success ? 'settled' : 'failed';
+              req.span.outcome = result.success ? 'ok' : 'rejected';
+              req.span.reason = result.success
+                ? 'none'
+                : (result.errorReason ?? 'settlement_failed');
+              req.span.txHash = result.transaction || null;
+              req.span.feeStroops = actualFee;
+            }
+            handleRateLimit(reply, check);
+            if (result.success) {
+              // Settlement notification (#123): the event is written to the
+              // outbox in the SAME database transaction as the 'settled' state
+              // change, so a crash between settling and notifying cannot lose
+              // the notification — the outbox worker publishes it afterwards.
+              // Only when no durable outbox exists (in-memory store or degraded
+              // Postgres) do we fall back to the fire-and-forget webhook
+              // publish (#117), which is the pre-outbox behaviour.
+              const event = webhooks
+                ? {
+                    type: 'settlement.completed',
+                    transaction: result.transaction,
+                    network: result.network,
+                    payer: result.payer,
+                    payTo: body.paymentRequirements.payTo,
+                    amount: body.paymentRequirements.maxAmountRequired,
+                    asset: body.paymentRequirements.asset,
+                  }
+                : null;
+
+              const enqueued = await settlementStore.settleAndEnqueue(
+                idempotencyKey,
+                { tx_hash: result.transaction, response: result },
+                event,
+              );
+
+              await processCataloging(req, body, reply, 'payment');
+
+              if (
+                !enqueued.atomicallyEnqueued &&
+                enqueued.event &&
+                webhooks &&
+                typeof webhooks.enqueue === 'function'
+              ) {
+                webhooks.enqueue(enqueued.event);
+              }
+
+              if (idempotency && replay) {
+                await idempotency.complete(replay.key, 200, result);
+              }
+
+              // Settlements are THE auditable record: which authenticated caller moved
+              // money, and the transaction hash to reconstruct it by.
+              audit('settlement', {
+                actor: req.keyId ?? `ip:${req.ip}`,
+                outcome: result.success ? 'settled' : 'failed',
+                transaction: result.transaction || null,
+                network: result.network ?? body.paymentRequirements.network,
+                fee_stroops: actualFee,
+                error_reason: result.errorReason ?? null,
+              });
+              return result;
+            }
+
+            // Failure path: record the rejected settlement so a later repeat is
+            // not retried (unless the reason is in the retryable set, handled
+            // upstream when reading the existing record).
+            await settlementStore.updateState(idempotencyKey, 'failed', {
+              tx_hash: result.transaction || null,
+              error_reason: result.errorReason || 'facilitator_error',
+              error_message: result.errorMessage || null,
+              response: result,
+            });
+
+            if (idempotency && replay) {
+              await idempotency.complete(replay.key, 200, result);
+            }
+
+            audit('settlement', {
+              actor: req.keyId ?? `ip:${req.ip}`,
+              outcome: result.success ? 'settled' : 'failed',
+              transaction: result.transaction || null,
+              network: result.network ?? body.paymentRequirements.network,
+              fee_stroops: actualFee,
+              error_reason: result.errorReason ?? null,
+            });
+            return result;
+          } finally {
+            if (signer) metrics.setSignerInflight({ network, signer, value: 0 });
+          }
+        };
+        const timeoutMs = config.requestTimeoutMs ?? 30_000;
+        let timeoutTimer;
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            const err = new Error('request timeout');
+            err.code = 'REQUEST_TIMEOUT';
+            reject(err);
+          }, timeoutMs);
+        });
+
+
           const result = await Promise.race([resultPromise, timeoutPromise]).finally(() => {
             clearTimeout(timeoutTimer);
           });
@@ -1018,6 +1311,7 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
             errorReason = 'unsupported_scheme_network';
           }
 
+
           let transaction = '';
           if (
             body.paymentPayload?.transaction &&
@@ -1033,6 +1327,41 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
             error_message: err instanceof Error ? err.message : String(err),
           });
 
+        const result = await Promise.race([resultPromise, timeoutPromise]).finally(() => {
+          clearTimeout(timeoutTimer);
+        });
+        return reply.send(result);
+      } catch (err) {
+        // SettleResponse requires `transaction` and `network` even on failure, so
+        // a client can attribute the failure without correlating out of band.
+        //
+        // A lock that never freed under healthy Redis gets its own code (#116),
+        // and an open RPC breaker gets its own code so a caller can tell "the
+        // chain is unreachable" from "your payment was rejected" (#105, #6).
+        let errorReason = 'facilitator_error';
+        if (err?.code === 'REQUEST_TIMEOUT') {
+          // A timeout after the scheme was actually submitted leaves the outcome
+          // unknown on our side: report it distinctly so a caller can reconcile
+          // out of band (#8).
+          errorReason =
+            requestState.getStore()?.submitted === true
+              ? 'submitted_outcome_unknown'
+              : 'request_timeout';
+        } else if (err instanceof Error && err.name === 'LockAcquireTimeoutError') {
+          errorReason = 'lock_timeout';
+        } else if (err?.code === 'RPC_BREAKER_OPEN') {
+          errorReason = 'soroban_rpc_unreachable';
+          audit('rpc_unreachable', { actor: req.keyId ?? `ip:${req.ip}`, op: 'settle' });
+        } else if (err?.message?.includes('unregistered')) {
+          errorReason = 'unsupported_scheme_network';
+        }
+        if (req.span) {
+          req.span.outcome = 'error';
+          req.span.reason = errorReason;
+          req.span.settleOutcome = 'failed';
+        }
+
+
           return reply.send({
             success: false,
             errorReason,
@@ -1041,7 +1370,24 @@ export function createApp(config, facilitator, rateLimiter, catalog, idempotency
             network: req.body?.paymentRequirements?.network ?? '',
           });
         }
+
       });
+
+        const targetState = errorReason === 'submitted_outcome_unknown' ? 'unknown' : 'failed';
+        await settlementStore.updateState(idempotencyKey, targetState, {
+          tx_hash: transaction,
+          error_reason: errorReason,
+          error_message: err instanceof Error ? err.message : String(err),
+        });
+        return reply.send({
+          success: false,
+          errorReason,
+          errorMessage: err instanceof Error ? err.message : String(err),
+          transaction,
+          network: req.body?.paymentRequirements?.network ?? '',
+        });
+      }
+
     },
   );
 
