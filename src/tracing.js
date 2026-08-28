@@ -29,7 +29,7 @@
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { W3CTraceContextPropagator } from '@opentelemetry/core';
-import { Resource } from '@opentelemetry/resources';
+import { resourceFromAttributes } from '@opentelemetry/resources';
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
 import { trace as apiTrace } from '@opentelemetry/api';
 
@@ -61,8 +61,7 @@ function parseHeaders(raw) {
  * @returns {string | undefined} undefined → exporter uses its own default
  */
 function resolveOtlpEndpoint(env) {
-  const given =
-    env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT ?? env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  const given = env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT ?? env.OTEL_EXPORTER_OTLP_ENDPOINT;
   if (!given) return undefined; // exporter default: http://localhost:4318/v1/traces
   if (given.endsWith('/v1/traces')) return given;
   return `${given.replace(/\/+$/, '')}/v1/traces`;
@@ -93,7 +92,7 @@ export function initTracing(env = process.env) {
 
   sdk = new NodeSDK({
     serviceName,
-    resource: new Resource({ 'service.name': serviceName }),
+    resource: resourceFromAttributes({ 'service.name': serviceName }),
     textMapPropagator: new W3CTraceContextPropagator(),
     traceExporter: exporter,
     instrumentations: [
