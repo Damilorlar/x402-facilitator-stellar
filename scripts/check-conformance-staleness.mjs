@@ -15,33 +15,33 @@
 //
 // Usage: node scripts/check-conformance-staleness.mjs [--report=docs/CONFORMANCE.md]
 
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import process from "node:process";
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import process from 'node:process';
 
-const DEFAULT_REPORT = "docs/CONFORMANCE.md";
+const DEFAULT_REPORT = 'docs/CONFORMANCE.md';
 
 function parseArgs(argv) {
   let report = DEFAULT_REPORT;
   for (const a of argv) {
-    if (a.startsWith("--report=")) report = a.slice("--report=".length);
+    if (a.startsWith('--report=')) report = a.slice('--report='.length);
   }
   return { report };
 }
 
 function git(args, { allowFail = false } = {}) {
   try {
-    return execFileSync("git", args, { encoding: "utf8" }).trim();
+    return execFileSync('git', args, { encoding: 'utf8' }).trim();
   } catch (e) {
-    if (allowFail) return "";
+    if (allowFail) return '';
     throw e;
   }
 }
 
-function ancestorExitCode(sha, ref = "HEAD") {
+function ancestorExitCode(sha, ref = 'HEAD') {
   try {
-    execFileSync("git", ["merge-base", "--is-ancestor", sha, ref], {
-      stdio: "ignore",
+    execFileSync('git', ['merge-base', '--is-ancestor', sha, ref], {
+      stdio: 'ignore',
     });
     return 0;
   } catch {
@@ -59,17 +59,13 @@ function main() {
 
   let text;
   try {
-    text = readFileSync(report, "utf8");
+    text = readFileSync(report, 'utf8');
   } catch {
     fail(`Conformance report not found at ${report}. Create docs/CONFORMANCE.md.`);
   }
 
-  const shaMatch = text.match(
-    /<!--\s*conformance-facilitator-sha:\s*([0-9a-f]+)\s*-->/,
-  );
-  const thresholdMatch = text.match(
-    /<!--\s*conformance-staleness-threshold:\s*(\d+)\s*-->/,
-  );
+  const shaMatch = text.match(/<!--\s*conformance-facilitator-sha:\s*([0-9a-f]+)\s*-->/);
+  const thresholdMatch = text.match(/<!--\s*conformance-staleness-threshold:\s*(\d+)\s*-->/);
 
   if (!shaMatch) {
     fail(
@@ -93,27 +89,24 @@ function main() {
     );
   }
 
-  const ahead = Number(git(["rev-list", "--count", `${anchorSha}..HEAD`]));
+  const ahead = Number(git(['rev-list', '--count', `${anchorSha}..HEAD`]));
   console.log(`Commits on main since the anchor: ${ahead}`);
 
   if (ahead <= threshold) {
-    console.log(
-      `OK — report is ${ahead} commit(s) behind, within the ${threshold} threshold.`,
-    );
+    console.log(`OK — report is ${ahead} commit(s) behind, within the ${threshold} threshold.`);
     process.exit(0);
   }
 
   // Too far behind. It is only acceptable if the report was deliberately touched
   // in the intervening commits (i.e. someone re-validated it).
-  const log = git(
-    ["log", "--name-only", "--pretty=format:", `${anchorSha}..HEAD`, "--", report],
-    { allowFail: true },
-  );
+  const log = git(['log', '--name-only', '--pretty=format:', `${anchorSha}..HEAD`, '--', report], {
+    allowFail: true,
+  });
   const reportTouched = log
-    .split("\n")
-    .map((s) => s.trim())
+    .split('\n')
+    .map(s => s.trim())
     .filter(Boolean)
-    .some((f) => f === report || f.endsWith("CONFORMANCE.md"));
+    .some(f => f === report || f.endsWith('CONFORMANCE.md'));
 
   if (reportTouched) {
     console.log(
