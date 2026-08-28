@@ -181,21 +181,17 @@ test('W3C trace context propagates and spans carry metadata', { timeout: 30000 }
 /** Minimal JSON POST over Node's http client. */
 function postJson(url, body, headers = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request(
-      url,
-      { method: 'POST', headers },
-      res => {
-        let data = '';
-        res.on('data', c => (data += c));
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(data));
-          } catch (err) {
-            reject(err);
-          }
-        });
-      },
-    );
+    const req = http.request(url, { method: 'POST', headers }, res => {
+      let data = '';
+      res.on('data', c => (data += c));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
     req.on('error', reject);
     req.end(body);
   });
