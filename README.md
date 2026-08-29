@@ -80,8 +80,13 @@ Reference material: [Architecture](docs/ARCHITECTURE.md) ·
 [Bazaar discovery](docs/BAZAAR.md) · [MCP server](docs/MCP.md) ·
 [Conformance](docs/CONFORMANCE.md) · [Deployment](docs/DEPLOYMENT.md) ·
 [Operations](docs/OPERATIONS.md) · [Authentication](docs/AUTHENTICATION.md) ·
+ feat/upstream-drift-watch
+[Threat model](docs/THREAT-MODEL.md) · [Audit readiness](docs/AUDIT.md) ·
+[Privacy](docs/PRIVACY.md) · [Upstream tracking](docs/UPSTREAM.md) ·
+
 [Business model](docs/BUSINESS-MODEL.md) · [Threat model](docs/THREAT-MODEL.md) ·
 [Audit readiness](docs/AUDIT.md) · [Privacy](docs/PRIVACY.md) ·
+ main
 [Glossary](docs/GLOSSARY.md)
 
 Sibling repositories in the [Accensa organisation](https://github.com/accensa):
