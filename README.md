@@ -117,15 +117,15 @@ it is documented (and scripted) rather than left to a deep stack trace. Two help
 in `scripts/` handle the testnet side, wired to npm:
 
 ```bash
-npm run fund:testnet        # scripts/fund-testnet-accounts.mjs
-npm run prepare:testnet-usdc  # scripts/prepare-testnet-usdc.mjs
+npm run testnet:fund        # scripts/fund-testnet-accounts.mjs
+npm run testnet:usdc  # scripts/prepare-testnet-usdc.mjs
 ```
 
-- `npm run fund:testnet` creates three fresh accounts (client, server/payee,
+- `npm run testnet:fund` creates three fresh accounts (client, server/payee,
   facilitator), funds them via Friendbot, **opens a USDC trustline on each**, and
   prints the credentials as env assignments (`--json` / `--github-env` for other
   formats).
-- `npm run prepare:testnet-usdc` puts existing payer/payee accounts into a
+- `npm run testnet:usdc` puts existing payer/payee accounts into a
   pay-ready state: USDC trustlines on both, and a small USDC balance on the payer
   drawn from `TESTNET_USDC_TREASURY_SECRET` (testnet-only; reports
   `usdc_ready=false` honestly when the treasury is absent).
