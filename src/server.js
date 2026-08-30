@@ -25,6 +25,10 @@ import { createWebhookDispatcher } from './webhooks/dispatcher.js';
 import { FailoverHealthChecker } from './failover-health.js';
 import { initTracing } from './tracing.js';
 import { createApp } from './app.js';
+import { buildSettlementStore } from './store/index.js';
+import { startReconciliationLoop } from './store/reconciliation.js';
+import { startOutboxWorker } from './outbox/index.js';
+import { createVaultManagedDatabase } from './vault/index.js';
 
 // A .env file is a development convenience, not a deployment mechanism — in
 // production the environment comes from the orchestrator, so a stray .env left
@@ -144,10 +148,6 @@ const failoverHealth = config.region
       log: msg => console.log(`  ${msg}`),
     })
   : null;
-import { buildSettlementStore } from './store/index.js';
-import { startReconciliationLoop } from './store/reconciliation.js';
-import { startOutboxWorker } from './outbox/index.js';
-import { createVaultManagedDatabase } from './vault/index.js';
 const settlementStore = buildSettlementStore(config, { pool: vaultDatabase?.pool });
 const reconciliation = startReconciliationLoop(settlementStore, config);
 
@@ -169,7 +169,7 @@ const outboxWorker =
     : null;
 outboxWorker?.start();
 
-const app = createApp(config, facilitator, rateLimiter, catalog, idempotency, {
+const app = await createApp(config, facilitator, rateLimiter, catalog, idempotency, {
   breakerStates: rpc?.getBreakerStates,
   distributedLock,
   webhooks,
