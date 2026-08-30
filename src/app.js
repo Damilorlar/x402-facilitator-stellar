@@ -165,8 +165,6 @@ async function tracedSchemeCall(op, network, fn, extraAttrs = {}) {
   });
 }
 
-export function createApp(config, facilitator, rateLimiter, catalog, idempotency, extras = {}) {
-
 export async function createApp(
   config,
   facilitator,
