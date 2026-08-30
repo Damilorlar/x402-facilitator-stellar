@@ -20,7 +20,7 @@ import { RedisRateLimiter } from './redis-rate-limit.js';
 import { CrdtRateLimitStore } from './crdt-rate-limit-store.js';
 import { createDistributedLock } from './distributed-lock.js';
 import { buildIdempotencyStore } from './idempotency.js';
-import { MemoryCatalogStore } from './catalog/memory.js';
+import { buildCatalogStore } from './catalog/postgres.js';
 import { createWebhookDispatcher } from './webhooks/dispatcher.js';
 import { FailoverHealthChecker } from './failover-health.js';
 import { initTracing } from './tracing.js';
@@ -121,7 +121,23 @@ if (config.rateLimitStore === 'crdt' && config.databaseUrl) {
   });
   rateLimiter = new RateLimiter(config.rateLimits, rateLimitStore);
 }
-const catalog = new MemoryCatalogStore(config);
+const catalog = buildCatalogStore(config, {
+  log: msg => console.warn(`  ${msg}`),
+  pool: vaultDatabase?.pool,
+});
+// Off the hot path: a periodic sweep physically removes expired provisional
+// (verify-only) listings so they do not accumulate forever (#140).
+const catalogPruneTimer =
+  config.catalogVerifyTtlMs > 0
+    ? globalThis.setInterval(
+        () => {
+          catalog
+            .pruneExpired()
+            .catch(err => console.warn(`[Catalog] prune sweep failed: ${err.message}`));
+        },
+        Math.min(config.catalogVerifyTtlMs, 60_000),
+      )
+    : null;
 const idempotency = buildIdempotencyStore(config, { pool: vaultDatabase?.pool });
 
 // Cross-process serialization for state transitions (#116). Absent config
@@ -297,6 +313,8 @@ async function shutdown(signal) {
       await crdtStore?.close().catch(() => {});
 
       failoverHealth?.stop();
+
+      if (catalogPruneTimer) globalThis.clearInterval(catalogPruneTimer);
 
       await rateLimiter?.close?.().catch(() => {});
       horizon.restore();
