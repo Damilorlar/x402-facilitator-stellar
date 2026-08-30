@@ -173,7 +173,6 @@ export async function createApp(
   idempotency,
   extras = {},
 ) {
-
   const {
     distributedLock = null,
     webhooks = null,
