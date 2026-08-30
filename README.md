@@ -185,6 +185,7 @@ Everything in `scripts/`, and where it is documented:
 | `prepare-testnet-usdc.mjs` | `npm run testnet:usdc` | Gives the payer and payee USDC trustlines and a funded balance. |
 | `select-conformance-components.mjs` | (CI, `conformance.yml`) | Decides which upstream e2e components a run exercises; documented in docs/CONFORMANCE.md. |
 | `bench-http.mjs` | `npm run bench` | Local throughput benchmark of the HTTP surface with stubbed collaborators. |
+| `check-conformance-staleness.mjs` | (CI gate) | Fails if docs/CONFORMANCE.md is stale relative to main facilitator commit SHA. |
 | `data_retention_job.js` | — | **Not implemented.** Exits non-zero on purpose: it is scheduled to enforce the docs/PRIVACY.md retention periods once a datastore exists, and nothing is purged until then. Tracked in [Issue #50](https://github.com/accensa/x402-facilitator-stellar/issues/50). |
 
 ### Privacy and Data Minimisation
