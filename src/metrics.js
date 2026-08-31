@@ -127,6 +127,18 @@ class Gauge {
     this.series.set(key, { labels: { ...labels }, value });
   }
 
+  inc(labels = {}, value = 1) {
+    const key = labelKey(labels);
+    const current = this.series.get(key)?.value ?? 0;
+    this.set(labels, current + value);
+  }
+
+  dec(labels = {}, value = 1) {
+    const key = labelKey(labels);
+    const current = this.series.get(key)?.value ?? 0;
+    this.set(labels, Math.max(0, current - value));
+  }
+
   render() {
     let out = `# HELP ${this.name} ${this.help}\n# TYPE ${this.name} gauge\n`;
     for (const { labels, value } of this.series.values()) {
