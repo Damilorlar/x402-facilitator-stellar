@@ -1002,6 +1002,7 @@ export async function createApp(
       attachValidation: true,
     },
     async (req, reply) => {
+
       return withRequestSpan(`HTTP ${req.method} /settle`, req, async () => {
         const body = readPaymentBody(req, reply, 'settle');
         if (!body) return reply;
@@ -1010,6 +1011,78 @@ export async function createApp(
         if (req.span) {
           req.span.network = network;
           req.span.scheme = body.paymentRequirements.scheme;
+
+      const body = readPaymentBody(req, reply, 'settle');
+      if (!body) return reply;
+      const network = body.paymentRequirements.network;
+      const signer = signers[network] ?? null;
+      if (req.span) {
+        req.span.network = network;
+        req.span.scheme = body.paymentRequirements.scheme;
+      }
+
+      const check = await rateLimiter.checkSettle(req, network);
+      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
+
+      /**
+       * Degraded-mode gate (#10, #19): if a durable settlement record store was
+       * expected but is currently down, refuse to settle rather than risk
+       * settling with no durable record (which would defeat idempotency/audit on
+       * retry). `/verify` stays up. The in-memory default (`DATABASE_URL` unset)
+       * is never "degraded", so open testnet is unaffected.
+       */
+      if (
+        config.requireDurableSettlementStore &&
+        config.databaseUrl &&
+        settlementStore.degraded === true
+      ) {
+        audit('settlement_refused', {
+          actor: req.keyId ?? `ip:${req.ip}`,
+          reason: 'settlement_store_unavailable',
+          network: body.paymentRequirements.network,
+        });
+        handleRateLimit(reply, check);
+        return reply.code(503).send({
+          success: false,
+          errorReason: 'settlement_store_unavailable',
+          errorMessage:
+            'Settlement record store is unavailable; refusing to settle without a durable record. Retry once the store recovers.',
+          transaction: '',
+          network: body.paymentRequirements.network,
+        });
+      }
+
+      const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
+      const existingRecord = await settlementStore.get(idempotencyKey);
+
+      if (existingRecord) {
+        if (existingRecord.state === 'settled') {
+          handleRateLimit(reply, check);
+          if (existingRecord.response) {
+            const respPayload =
+              typeof existingRecord.response === 'string'
+                ? JSON.parse(existingRecord.response)
+                : existingRecord.response;
+            return reply.send(respPayload);
+          }
+          return reply.send({
+            success: true,
+            transaction: existingRecord.tx_hash,
+            network: existingRecord.network,
+            payer: existingRecord.payer,
+          });
+        }
+        if (existingRecord.state === 'submitted' || existingRecord.state === 'unknown') {
+          handleRateLimit(reply, check);
+          return reply.send({
+            success: false,
+            errorReason: 'submitted_outcome_unknown',
+            errorMessage:
+              existingRecord.error_message || 'settlement in progress or outcome unknown',
+            transaction: existingRecord.tx_hash || '',
+            network: existingRecord.network,
+          });
+
         }
 
         const checkSettle = await rateLimiter.checkSettle(req, network);
