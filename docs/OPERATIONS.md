@@ -195,96 +195,201 @@ If a specific signer's `x402_signer_selected_total` counter stops incrementing w
 
 To add a new signer to the pool, generate and fund a new Stellar account, append its secret key to `FACILITATOR_SECRETS`, and restart the facilitator process. Boot validation ensures that malformed or duplicate secret keys are rejected before accepting traffic.
 
-## Monitoring
+---
 
-### What is observed
+# Availability, External Monitoring & Status (issue #19)
 
-| Source | What it answers | Notes |
-| --- | --- | --- |
-| `GET /healthz` | liveness | Always `{ ok: true }` while the process runs; wire it to restart logic only. |
-| `GET /readyz` | readiness | Per-network RPC reachability and signer funding; names the failing check. Wire to traffic gating. |
-| `GET /metrics` | Prometheus text | Settlement/verification counters, signer selection and in-flight gauges, circuit-breaker state. |
-| Audit log | who did what | Settlements (with tx hash), auth failures, rate-limit rejections, catalog writes — one JSON line per event (`AUDIT_LOG_FILE` to mirror to a file). |
-| Request log | one redacted line per request | Headers redacted; the body is never logged. |
+> **Status of this section.** These targets are the *commitment* a third party can
+> depend on. They apply to any **publicly deployed** endpoint (see the deployment
+> blocker [#16](https://github.com/accensa/x402-facilitator-stellar/issues/16)).
+> Until an instance is reachable at a URL, the targets are published but unmet and
+> the status page reports `no_sla` — that is the honest state, not a failure to
+> measure. The whole point of this issue is to make "we don't know" impossible to
+> hide: see the org's own silent indexer outage that lost 207 ledgers
+> ([incident history](status/incidents.json)).
 
-### What to alert on
+## Numeric availability & latency targets
 
-| Alert | Signal | Runbook step |
-| --- | --- | --- |
-| Instance not ready | `/readyz` 503 | [RPC outage](#runbook-responding-to-an-rpc-outage) / [signer underfunded](#runbook-settlement-starting-to-fail) |
-| RPC unreachable | `soroban_rpc_unreachable` reason codes, breaker open | [RPC outage](#runbook-responding-to-an-rpc-outage) |
-| Signer balance low | readiness `signer_funded` failing | [Settlement starting to fail](#runbook-settlement-starting-to-fail) |
-| Stuck signer | `x402_signer_inflight` non-zero past max latency; selection counter stalled | [Stuck signer](#stuck-signer) |
-| Fee ceiling near cap | `fee_spd` approaching the limit | [Settlement starting to fail](#runbook-settlement-starting-to-fail) |
+All targets are measured by **external probes**, never by the service's own logs.
+A number we report about ourselves is not a measurement.
 
-### The uptime evidence
+### Availability per public endpoint
 
-The RFP asks for a 99%+ availability target evidenced, not asserted. This repo makes
-**no availability claim today**: no instance is operated, so there is nothing to
-measure, and self-reported uptime from the service itself is exactly the kind of
-evidence that does not count. External probes (liveness, readiness, a synthetic
-testnet payment, signer balance) with a named alert owner and a public status page are
-the deliverable, tracked in
-[#19](https://github.com/accensa/x402-facilitator-stellar/issues/19) — this section is
-the monitoring contract that issue will implement, not a claim that it exists yet.
+| Endpoint | Environment | Availability target | Measurement |
+|---|---|---|---|
+| `GET /healthz` | all | **99.9%** in 30d | external probe from outside our infra, 1-min interval |
+| `GET /readyz` | all | **99.9%** in 30d | external probe, 1-min interval (503 counts as down) |
+| `POST /verify` | all | **99.5%** in 30d | synthetic client, success-or-fast-fail (see degraded mode) |
+| `POST /settle` | all | **99.5%** in 30d | synthetic client end-to-end on testnet |
+| `GET /supported` | all | **99.9%** in 30d | external probe |
+| synthetic E2E payment | testnet | **99.0%** in 30d | the probe that matters — see below |
 
-## Runbook
+"Down" for `/readyz` means a `503` or no answer within the probe timeout. A green
+`/healthz` with a red synthetic payment is a **real outage** and is what the
+synthetic-payment probe exists to catch.
 
-### Runbook: deploying
+### Latency targets (p50 / p95 / p99)
 
-1. Build and tag the image by digest; push to your registry.
-2. Apply migrations before the process binds the port
-   (`psql "$DATABASE_URL" -f migrations/001_bazaar_catalog.sql`, then
-   `002_idempotency_keys.sql`).
-3. Start; gate traffic on `GET /readyz` going 200.
-4. Smoke-test with a real payment (the buyer guide's script in
-   [`docs/BUYER.md`](./BUYER.md) is a ready-made smoke test).
+Measured at the probe from first byte out to last byte in, over a rolling **7-day**
+window, reviewed **weekly** (see below).
 
-### Runbook: upgrading
+| Endpoint | p50 | p95 | p99 | Notes |
+|---|---|---|---|---|
+| `POST /verify` | 150 ms | 600 ms | 1.5 s | read-only, no chain submit |
+| `POST /settle` | 2 s | 6 s | 12 s | bounded by Soroban submit + confirmation |
+| `GET /supported` | 20 ms | 80 ms | 200 ms | static config |
+| `GET /healthz` | 5 ms | 20 ms | 50 ms | liveness only |
+| `GET /readyz` | 50 ms | 200 ms | 500 ms | one RPC `getHealth` per network, cached 5 s |
 
-1. Check `docs/CONFORMANCE.md` and the diff of `package.json` for wire-format changes
-   before upgrading — a bump of `@x402/*` can change response shapes.
-2. Rolling restart; both old and new must serve `/verify` during cutover.
-3. If a migration shipped, verify the previous image can still read the new schema
-   before finishing the roll.
+`/settle` p99 is capped by `REQUEST_TIMEOUT_MS` (default 30 s) and the RPC retry
+budget; a settle that exceeds p99 should be failing fast, not hanging.
 
-### Runbook: rotating keys
+### Measurement window & review
 
-1. Generate a new keypair, fund it, append it to `FACILITATOR_SECRETS` (pool mode)
-   alongside the old one; restart; confirm `/readyz` passes and a settlement works.
-2. Remove the old key from the pool; restart again.
-3. For a fee-bump signer, repeat with `FEE_BUMP_SECRET`, funding the new account before
-   the old one is drained.
+- **Window:** availability is computed over a **rolling 30 days**; latency over a
+  **rolling 7 days**. Both are recomputed every probe cycle and rendered on the
+  status page.
+- **Reviewer:** the **Facilitator On-Call** (named in [Alerting &
+  Escalation](#alerting--escalation)) reviews the weekly digest every Monday
+  09:00 UTC and records the verdict in `status/incidents.json` as a `review`
+  entry. Missing a review is itself an incident.
+- **Public record:** the raw probe results feed `status/status.json`; the status
+  page is the single source of truth a dependent can cite.
 
-### Runbook: responding to an RPC outage
+## External monitoring
 
-1. **Detect:** `/readyz` reports `rpc_reachable: false`; clients see
-   `soroban_rpc_unreachable` and back off themselves.
-2. **Contain:** traffic gating on `/readyz` stops routing new traffic; the circuit
-   breaker refuses fast rather than hanging.
-3. **Diagnose:** check the RPC provider's status; confirm `STELLAR_RPC_URL` /
-   `STELLAR_RPC_URL_PUBNET` point where you think they do.
-4. **Recover:** switch the RPC URL (env change + restart) or wait for the provider; the
-   breaker half-opens probes and closes once the backend heals.
-5. **Do not** restart-loop on `/healthz` — a restart cannot fix someone else's RPC.
+Probes run from **outside our own infrastructure** so a silent outage on our side
+cannot also silence its own monitor. In this repo that is a GitHub Actions cron
+workflow (`.github/workflows/external-monitor.yml`) executing
+`monitoring/probes.mjs` from GitHub's runners against the public endpoint. A
+self-hosted deployment should point the same script at a separate cloud account.
 
-### Runbook: settlement starting to fail
+### Minimum probe set
 
-1. **Detect:** `/readyz` `signer_funded` fails, or `fee_spd` sits at the ceiling.
-2. **Underfunded signer:** fund the account(s) above `READINESS_FUNDING_FLOOR_STROOPS`;
-   readiness clears on the next check.
-3. **Fee ceiling reached:** the meter working as designed. Raise `fee_spd` for the
-   affected key or accept the cap — the ceiling bounds what an abusive caller can drain.
-4. **Stuck signer:** remove the stuck account from `FACILITATOR_SECRETS`, restart,
-   reconcile the sequence number, re-add once healthy.
-5. **`submitted_outcome_unknown` callers:** tell them to look up the transaction hash
-   on-chain before resubmitting — resubmitting a settled payment risks paying twice.
+1. **Liveness** — `GET /healthz` per environment. Expects `200 { ok: true }`.
+2. **Readiness** — `GET /readyz` per environment. Expects `200`; a `503` is a
+   pageable "instance cannot settle" signal, not a restart trigger.
+3. **Synthetic end-to-end payment** — a real `/verify` + `/settle` round trip on
+   **testnet** on a schedule (default every 15 min). This is the probe that
+   matters: liveness can be green while settlement is broken. It reuses the
+   unmodified canonical client path from `scripts/e2e.mjs` so it exercises the
+   same wire contract a real payer does.
+4. **Signer balance** — for each network, read the facilitator signer account
+   balance via RPC and alert **before** it runs dry (`SIGNAL_FLOOR_STROOPS`),
+   warn at `WARN_FLOOR_STROOPS`. A dry signer is a hard settlement outage.
 
-### Runbook: rollback
+### Probe output contract
 
-Revert to the previously known-good image tag/digest. If a migration shipped in the
-failed deploy, verify the old image's schema compatibility before restarting it (see
-[`docs/DEPLOYMENT.md`](./DEPLOYMENT.md) § Rollback Procedure).
+`monitoring/probes.mjs` exits non-zero on any failed probe and writes
+`monitoring/out/status.json` with the per-probe result, latency, and a
+`degraded`/`down` verdict. The status-page publish workflow consumes that file.
 
-The same runbook, framed for the operator persona with the diagnosis steps spelled out,
-is in [`docs/OPERATOR.md`](./OPERATOR.md) § 7.
+## Alerting & escalation
+
+An alert with no owner is a log line. Every alert below routes to a **named
+recipient** with a documented **escalation path**.
+
+| Alert | Severity | Owner (named recipient) | Escalation path |
+|---|---|---|---|
+| `/healthz` down (any env) | SEV2 | Facilitator On-Call | page → if no ack in 15 min, escalate to Accensa maintainers (SUPPORT.md channels) |
+| `/readyz` 503 (cannot settle) | SEV1 | Facilitator On-Call | page → 15 min → maintainers; open incident in `status/incidents.json` |
+| Synthetic payment failed | SEV1 | Facilitator On-Call | page → 15 min → maintainers; this is the "liveness green, settlement broken" case |
+| Signer balance < WARN floor | SEV3 | Facilitator On-Call | notify; fund pool before it hits SIGNAL floor |
+| Signer balance < SIGNAL floor | SEV1 | Facilitator On-Call | page + auto-open incident; settlements will fail until funded |
+| RPC unreachable (breaker open) | SEV1 | Facilitator On-Call | page → maintainers; verify provider, not our code |
+| Settlement store unavailable | SEV1 | Facilitator On-Call | page; `/settle` already refuses fast (`settlement_store_unavailable`) |
+
+**Named recipient.** The recipient is the **Accensa Facilitator On-Call**,
+reachable through the channels in [`SUPPORT.md`](SUPPORT.md) (Telegram / Discord)
+and the `FACILITATOR_ONCALL_EMAIL` secret. On-call rotation is owned by the
+Accensa maintainers. **Escalation** is always: On-Call → Accensa maintainers →
+org owners; the same channels are the human escalation path, so a rotated invite
+link changes one file, not every runbook.
+
+## Degraded-mode behaviour
+
+Fail fast with a documented reason; never hang. (The "why" for each is in
+`src/readiness.js` and `src/app.js`.)
+
+### RPC unreachable
+
+- The RPC circuit breaker (`RPC_BREAKER_THRESHOLD` / `RPC_BREAKER_COOLDOWN_MS`)
+  opens after consecutive failures and `/settle` returns `soroban_rpc_unreachable`
+  immediately — it does **not** inherit the ~12 s retry budget.
+- `/readyz` reports `rpc_reachable: false` per network; orchestrators stop routing
+  here. `/healthz` stays green (a downstream outage must not restart us).
+- Probe timeout is bounded by `READINESS_TIMEOUT_MS` (3 s) so a dead RPC fails
+  fast instead of hanging the probe window.
+
+### Database / settlement store unavailable (#10)
+
+- With `SETTLE_REQUIRE_DURABLE_STORE=true` and `DATABASE_URL` set, if the durable
+  settlement store is down, `/settle` refuses with `settlement_store_unavailable`
+  (503) and a clear message — **it does not settle without a record**. This is the
+  fix for "settle without a record" double-spend risk on retry.
+- `/verify` is **never** gated by the store — verification reads no durable state,
+  so it stays fully available during a DB outage.
+- Without the flag (open testnet, no `DATABASE_URL`), the in-memory fallback is
+  intentional and the gate does not apply.
+
+### Signer stuck / underfunded
+
+- `/readyz` reports `signer_funded: false` and `503`s when any pool signer is
+  below `READINESS_FUNDING_FLOOR_STROOPS`.
+- Stuck signers are detected from Prometheus metrics (`x402_signer_selected_total`
+  flat while peers advance, or `x402_signer_inflight` stuck above max latency).
+  On detection: drain traffic from that replica (readiness already 503s per
+  network) and rotate the stuck signer out of `FACILITATOR_SECRETS`; do not retry
+  forever against a desynced sequence number.
+
+## Status page
+
+A public status page lives in `status/` and is published to GitHub Pages
+(`.github/workflows/publish-status.yml`). It shows current state from
+`status/status.json` and an **incident history** from `status/incidents.json`.
+The README links to it. The incident history is the trust-building half: a status
+page with no incidents ever recorded is not credible, so the history starts with
+an honest pre-deployment entry documenting the silent-outage risk this issue
+closes.
+
+## Runbooks (per alert)
+
+Each runbook: **what fired → what to check → what to do.** Kept inline so the
+alert and the fix travel together.
+
+### `/readyz` 503 — instance cannot settle
+- **Fired:** `/readyz` returned 503 for a network.
+- **Check:** read `networks[].rpc_reachable` and `networks[].signer_funded` in the
+  response. `breakers` shows open breakers; `catalog` is reported but never the
+  cause.
+- **Do:** if `rpc_reachable:false` → RPC provider down, verify `STELLAR_RPC_URL`,
+  breaker cools down on its own. If `signer_funded:false` → fund the signer above
+  the floor; traffic resumes automatically on next probe.
+
+### Synthetic payment failed
+- **Fired:** the E2E probe could not `/verify`+`/settle` on testnet.
+- **Check:** `/healthz` (is the process up?), `/readyz` (can it settle?),
+  signer balance, and the probe's captured error. A green `/healthz` + red
+  synthetic payment is the exact "settlement broken but alive" case.
+- **Do:** reproduce with `npm run e2e` against the instance; check RPC breaker,
+  signer funding, and `REQUEST_TIMEOUT_MS`. Open an incident.
+
+### Signer balance below floor
+- **Fired:** signer XLM (or asset) dropped under WARN/SIGNAL floor.
+- **Check:** `signer_funded` in `/readyz`; confirm on explorer.
+- **Do:** fund the signer before it hits the SIGNAL floor. Below SIGNAL, settlements
+  fail — page and fund immediately; rotate the account if compromised.
+
+### RPC breaker open
+- **Fired:** `breakers` shows `open` for a network's RPC host.
+- **Check:** is the provider reachable from elsewhere? Is it our egress?
+- **Do:** confirm provider status; breaker half-opens after `RPC_BREAKER_COOLDOWN_MS`.
+  If provider is dead, switch `STELLAR_RPC_URL` and redeploy.
+
+### Settlement store unavailable
+- **Fired:** `SETTLE_REQUIRE_DURABLE_STORE=true` and Postgres down → `/settle`
+  returns `settlement_store_unavailable`.
+- **Check:** `DATABASE_URL` reachability; Postgres logs.
+- **Do:** restore Postgres; `/settle` auto-recovers. `/verify` stayed up throughout.
+  Do **not** disable the flag to "fix" the alert — that removes the guard.
+

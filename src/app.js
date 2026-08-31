@@ -899,6 +899,34 @@ export async function createApp(
       const check = await rateLimiter.checkSettle(req, network);
       if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
 
+      /**
+       * Degraded-mode gate (#10, #19): if a durable settlement record store was
+       * expected but is currently down, refuse to settle rather than risk
+       * settling with no durable record (which would defeat idempotency/audit on
+       * retry). `/verify` stays up. The in-memory default (`DATABASE_URL` unset)
+       * is never "degraded", so open testnet is unaffected.
+       */
+      if (
+        config.requireDurableSettlementStore &&
+        config.databaseUrl &&
+        settlementStore.degraded === true
+      ) {
+        audit('settlement_refused', {
+          actor: req.keyId ?? `ip:${req.ip}`,
+          reason: 'settlement_store_unavailable',
+          network: body.paymentRequirements.network,
+        });
+        handleRateLimit(reply, check);
+        return reply.code(503).send({
+          success: false,
+          errorReason: 'settlement_store_unavailable',
+          errorMessage:
+            'Settlement record store is unavailable; refusing to settle without a durable record. Retry once the store recovers.',
+          transaction: '',
+          network: body.paymentRequirements.network,
+        });
+      }
+
       const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
       const existingRecord = await settlementStore.get(idempotencyKey);
 
