@@ -347,6 +347,13 @@ async function shutdown(signal) {
   const shutdownPromise = (async () => {
     try {
       reconciliation?.stop();
+
+      failoverHealth?.stop();
+      await app.close();
+      await webhooks.stop().catch(() => {});
+      await distributedLock?.quit().catch(() => {});
+      await crdtStore?.close().catch(() => {});
+
       await outboxWorker?.stop();
       await dlqWorker?.stop();
       // Only end the DLQ pool if it is not the Vault-managed one — that pool
@@ -368,6 +375,7 @@ async function shutdown(signal) {
       if (catalogPruneTimer) globalThis.clearInterval(catalogPruneTimer);
 
       await rateLimiter?.close?.().catch(() => {});
+
       horizon.restore();
     } catch (err) {
       console.error(`Error during shutdown: ${err.message}`);
