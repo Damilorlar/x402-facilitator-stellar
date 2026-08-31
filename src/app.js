@@ -841,8 +841,8 @@ export async function createApp(
     },
     async (req, reply) => {
       return withRequestSpan(`HTTP ${req.method} /verify`, req, async () => {
-        const check = await rateLimiter.checkVerify(req);
-        if (!check.allowed) return rejectRateLimited(req, reply, '/verify', check);
+        const checkVerify = await rateLimiter.checkVerify(req);
+        if (!checkVerify.allowed) return rejectRateLimited(req, reply, '/verify', checkVerify);
 
       const check = await rateLimiter.checkVerify(req);
       if (!check.allowed) return rejectRateLimited(req, reply, '/verify', check);
@@ -896,7 +896,7 @@ export async function createApp(
         }
         try {
           await rateLimiter.recordVerify(req);
-          handleRateLimit(reply, check);
+          handleRateLimit(reply, checkVerify);
           const timeoutMs = config.requestTimeoutMs ?? 30_000;
           let timeoutTimer;
           const timeoutPromise = new Promise((_, reject) => {
@@ -1000,15 +1000,15 @@ export async function createApp(
           req.span.scheme = body.paymentRequirements.scheme;
         }
 
-        const check = await rateLimiter.checkSettle(req, network);
-        if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
+        const checkSettle = await rateLimiter.checkSettle(req, network);
+        if (!checkSettle.allowed) return rejectRateLimited(req, reply, '/settle', checkSettle);
 
         const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
         const existingRecord = await settlementStore.get(idempotencyKey);
 
         if (existingRecord) {
           if (existingRecord.state === 'settled') {
-            handleRateLimit(reply, check);
+            handleRateLimit(reply, checkSettle);
             if (existingRecord.response) {
               const respPayload =
                 typeof existingRecord.response === 'string'
@@ -1024,7 +1024,7 @@ export async function createApp(
             });
           }
           if (existingRecord.state === 'submitted' || existingRecord.state === 'unknown') {
-            handleRateLimit(reply, check);
+            handleRateLimit(reply, checkSettle);
             return reply.send({
               success: false,
               errorReason: 'submitted_outcome_unknown',
@@ -1043,7 +1043,7 @@ export async function createApp(
               'request_timeout',
             ]);
             if (!RETRYABLE.has(existingRecord.error_reason)) {
-              handleRateLimit(reply, check);
+              handleRateLimit(reply, checkSettle);
               if (existingRecord.response) {
                 const respPayload =
                   typeof existingRecord.response === 'string'
@@ -1085,7 +1085,7 @@ export async function createApp(
         };
         const replay = idempotency ? await idempotency.begin(idempotency.keyFor(idemReq)) : null;
         if (replay?.replayed) {
-          handleRateLimit(reply, check);
+          handleRateLimit(reply, checkSettle);
           return reply.code(replay.statusCode).send(replay.response);
         }
         /**
@@ -1125,8 +1125,8 @@ export async function createApp(
                 req.span.txHash = result.transaction || null;
                 req.span.feeStroops = actualFee;
               }
-              handleRateLimit(reply, check);
-              if (result.success) {
+handleRateLimit(reply, checkSettle);
+                if (result.success) {
                 // Settlement notification (#123): the event is written to the
                 // outbox in the SAME database transaction as the 'settled' state
                 // change, so a crash between settling and notifying cannot lose
@@ -1439,8 +1439,8 @@ export async function createApp(
       const body = readDiscoveryBody(req, reply);
       if (!body) return reply;
 
-      const check = await rateLimiter.checkCatalog(req);
-      if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/resources', check);
+      const checkCatalog = await rateLimiter.checkCatalog(req);
+      if (!checkCatalog.allowed) return rejectRateLimited(req, reply, '/discovery/resources', checkCatalog);
 
       const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
       if (validation.hardDrop) {
@@ -1484,8 +1484,8 @@ export async function createApp(
    */
   app.get('/discovery/resources', { onRequest: cors('public') }, async (req, reply) => {
     annotateSpan({ 'tenant.id': req.keyId ?? 'open', 'http.route': '/discovery/resources' });
-    const check = await rateLimiter.checkCatalogRead(req);
-    if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/resources', check);
+    const checkCatalogRead = await rateLimiter.checkCatalogRead(req);
+    if (!checkCatalogRead.allowed) return rejectRateLimited(req, reply, '/discovery/resources', checkCatalogRead);
 
     let extensions;
     if (req.query.extensions) {
@@ -1544,8 +1544,8 @@ export async function createApp(
    */
   app.get('/discovery/search', { onRequest: cors('public') }, async (req, reply) => {
     annotateSpan({ 'tenant.id': req.keyId ?? 'open', 'http.route': '/discovery/search' });
-    const check = await rateLimiter.checkCatalogRead(req);
-    if (!check.allowed) return rejectRateLimited(req, reply, '/discovery/search', check);
+    const checkCatalogRead = await rateLimiter.checkCatalogRead(req);
+    if (!checkCatalogRead.allowed) return rejectRateLimited(req, reply, '/discovery/search', checkCatalogRead);
 
     if (!req.query.query) {
       return reply.code(400).send({ error: 'invalid_request', reason: 'query is required' });
