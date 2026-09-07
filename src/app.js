@@ -1,4 +1,4 @@
-import { registerDlqRoutes } from "./dlq/routes.js";
+import { registerDlqRoutes } from './dlq/routes.js';
 /**
  * The HTTP surface: /verify, /settle, /supported, /usage, /discovery/resources,
  * /healthz, /health/ready.
