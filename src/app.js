@@ -51,8 +51,6 @@ import { buildSettlementStore } from './store/index.js';
 import { trace, context, propagation, SpanStatusCode } from '@opentelemetry/api';
 import { tracer } from './tracing.js';
 
-import { reg
-
 /** 256kb body cap, carried over unchanged from the Express transport. */
 const BODY_LIMIT_BYTES = 256 * 1024;
 
