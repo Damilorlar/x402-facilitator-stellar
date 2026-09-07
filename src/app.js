@@ -937,6 +937,10 @@ export async function createApp(
           });
         }
       });
+    },
+  );
+
+  app.post(
     '/settle',
     {
       onRequest: cors('authenticated'),
@@ -1054,7 +1058,6 @@ export async function createApp(
 
         try {
           const settleOnce = async () => {
-            // Sequence-contention signal (#9): this signer is now mid-settlement.
             if (signer) metrics.setSignerInflight({ network, signer, value: 1 });
             try {
               const result = await tracedSchemeCall(
@@ -1063,14 +1066,12 @@ export async function createApp(
                 () => facilitator.settle(body.paymentPayload, body.paymentRequirements),
                 { 'tenant.id': req.keyId ?? 'open' },
               );
-              // The fee ceiling (feeSpd) is reserved against the sponsored max, so
-              // the rate limiter is told the worst-case fee per settlement.
+              
               const sponsoredFee = result.success
                 ? (config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000)
                 : 0;
-              // The metrics/audit record the fee actually paid by this settlement.
               const actualFee = result.success ? result.transactionFeeStroops || 0 : 0;
-              await rateLimiter.recordSettle(req, sponsoredFee);
+              const recorded = await rateLimiter.recordSettle(req, sponsoredFee);
               if (req.span) {
                 req.span.settleOutcome = result.success ? 'settled' : 'failed';
                 req.span.outcome = result.success ? 'ok' : 'rejected';
@@ -1080,15 +1081,10 @@ export async function createApp(
                 req.span.txHash = result.transaction || null;
                 req.span.feeStroops = actualFee;
               }
-handleRateLimit(reply, checkSettle);
-                if (result.success) {
-                // Settlement notification (#123): the event is written to the
-                // outbox in the SAME database transaction as the 'settled' state
-                // change, so a crash between settling and notifying cannot lose
-                // the notification — the outbox worker publishes it afterwards.
-                // Only when no durable outbox exists (in-memory store or degraded
-                // Postgres) do we fall back to the fire-and-forget webhook
-                // publish (#117), which is the pre-outbox behaviour.
+              
+              applyRateLimitHead(reply, recorded, checkSettle);
+              
+              if (result.success) {
                 const event = webhooks
                   ? {
                       type: 'settlement.completed',
@@ -1107,7 +1103,7 @@ handleRateLimit(reply, checkSettle);
                   event,
                 );
 
-                await processCataloging(req, body, reply, 'payment');
+                await processCataloging(req, body, reply, 'settle');
 
                 if (
                   !enqueued.atomicallyEnqueued &&
@@ -1122,8 +1118,6 @@ handleRateLimit(reply, checkSettle);
                   await idempotency.complete(replay.key, 200, result);
                 }
 
-                // Settlements are THE auditable record: which authenticated caller moved
-                // money, and the transaction hash to reconstruct it by.
                 audit('settlement', {
                   actor: req.keyId ?? `ip:${req.ip}`,
                   outcome: result.success ? 'settled' : 'failed',
@@ -1133,72 +1127,8 @@ handleRateLimit(reply, checkSettle);
                   error_reason: result.errorReason ?? null,
                 });
                 return result;
-
-      try {
-        const settleOnce = async () => {
-          // Sequence-contention signal (#9): this signer is now mid-settlement.
-          if (signer) metrics.setSignerInflight({ network, signer, value: 1 });
-          try {
-            const result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
-            // The fee ceiling (feeSpd) is reserved against the sponsored max, so
-            // the rate limiter is told the worst-case fee per settlement.
-            const sponsoredFee = result.success
-              ? (config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000)
-              : 0;
-            // The metrics/audit record the fee actually paid by this settlement.
-            const actualFee = result.success ? result.transactionFeeStroops || 0 : 0;
-            const recorded = await rateLimiter.recordSettle(req, sponsoredFee);
-            if (req.span) {
-              req.span.settleOutcome = result.success ? 'settled' : 'failed';
-              req.span.outcome = result.success ? 'ok' : 'rejected';
-              req.span.reason = result.success
-                ? 'none'
-                : (result.errorReason ?? 'settlement_failed');
-              req.span.txHash = result.transaction || null;
-              req.span.feeStroops = actualFee;
-            }
-            applyRateLimitHead(reply, recorded, check);
-            if (result.success) {
-              // Settlement notification (#123): the event is written to the
-              // outbox in the SAME database transaction as the 'settled' state
-              // change, so a crash between settling and notifying cannot lose
-              // the notification — the outbox worker publishes it afterwards.
-              // Only when no durable outbox exists (in-memory store or degraded
-              // Postgres) do we fall back to the fire-and-forget webhook
-              // publish (#117), which is the pre-outbox behaviour.
-              const event = webhooks
-                ? {
-                    type: 'settlement.completed',
-                    transaction: result.transaction,
-                    network: result.network,
-                    payer: result.payer,
-                    payTo: body.paymentRequirements.payTo,
-                    amount: body.paymentRequirements.maxAmountRequired,
-                    asset: body.paymentRequirements.asset,
-                  }
-                : null;
-
-              const enqueued = await settlementStore.settleAndEnqueue(
-                idempotencyKey,
-                { tx_hash: result.transaction, response: result },
-                event,
-              );
-
-              await processCataloging(req, body, reply, 'settle');
-
-              if (
-                !enqueued.atomicallyEnqueued &&
-                enqueued.event &&
-                webhooks &&
-                typeof webhooks.enqueue === 'function'
-              ) {
-                webhooks.enqueue(enqueued.event);
-
               }
 
-              // Failure path: record the rejected settlement so a later repeat is
-              // not retried (unless the reason is in the retryable set, handled
-              // upstream when reading the existing record).
               await settlementStore.updateState(idempotencyKey, 'failed', {
                 tx_hash: result.transaction || null,
                 error_reason: result.errorReason || 'facilitator_error',
@@ -1471,7 +1401,7 @@ handleRateLimit(reply, checkSettle);
     try {
       const result = await catalog.listResources(params);
       await rateLimiter.recordCatalogRead(req);
-      handleRateLimit(reply, check);
+      handleRateLimit(reply, checkCatalogRead);
 
       return reply.send({
         x402Version: 2,
@@ -1532,7 +1462,7 @@ handleRateLimit(reply, checkSettle);
     try {
       const result = await catalog.search(params);
       await rateLimiter.recordCatalogRead(req);
-      handleRateLimit(reply, check);
+      handleRateLimit(reply, checkCatalogRead);
 
       return reply.send({
         x402Version: 2,
