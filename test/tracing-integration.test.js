@@ -132,7 +132,8 @@ test('W3C trace context propagates and spans carry metadata', { timeout: 30000 }
     propagation.inject(context.active(), headers);
     const body = await postJson(url, payload, headers);
     assert.equal(body.transaction, 'tx_deadbeef');
-    clientSpan.end(); return { traceId: sc.traceId, spanId: sc.spanId };
+    clientSpan.end();
+    return { traceId: sc.traceId, spanId: sc.spanId };
   });
 
   await app.close();

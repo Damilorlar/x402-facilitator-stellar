@@ -34,6 +34,37 @@
  * the process entrypoint and does nothing this file does.
  */
 import crypto from 'node:crypto';
+
+/**
+ * Stable, dependency-free serialization of the params that shape a discovery
+ * response, so the ETag is stable across request encodings of the same filter.
+ * Keys are sorted, arrays are sorted, and undefined/null are dropped.
+ */
+function canonicalizeDiscoveryParams(params) {
+  const out = {};
+  for (const key of Object.keys(params || {}).sort()) {
+    const v = params[key];
+    if (v === undefined || v === null) continue;
+    out[key] = Array.isArray(v) ? v.slice().sort() : String(v);
+  }
+  return JSON.stringify(out);
+}
+
+/**
+ * Weak ETag for a discovery response (#200). Keyed on BOTH the monotonic
+ * catalog version (any write changes it, so it invalidates every cached
+ * variant at once) AND the full parameter set (different filters are different
+ * representations and must never share a validator).
+ */
+function discoveryETag(catalogVersion, params) {
+  const hash = crypto
+    .createHash('sha1')
+    .update(canonicalizeDiscoveryParams(params))
+    .digest('base64url')
+    .replace(/=+$/, '');
+  return `W/"${catalogVersion}-${hash}"`;
+}
+
 import Fastify from 'fastify';
 import compress from '@fastify/compress';
 import { validateForCatalog } from './catalog/validation.js';
@@ -176,6 +207,7 @@ export async function createApp(
   const {
     distributedLock = null,
     webhooks = null,
+    dlq = null,
     failoverHealth = null,
     settlementStore = extras.settlementStore ?? buildSettlementStore(config),
   } = extras;
@@ -1357,6 +1389,49 @@ export async function createApp(
   );
 
   /**
+   * Discovery caching (#200).
+   *
+   * GET /discovery/resources and /discovery/search are the read-heavy half of
+   * the service and the half most likely to be polled, yet they carried no
+   * cache headers — so every agent query re-ran the ranking/embedding path over
+   * data the client already held. Both routes now emit:
+   *
+   *   - Cache-Control: configurable `public, max-age=…, stale-while-revalidate=…`
+   *   - a weak ETag derived from BOTH the monotonic catalog version (any write
+   *     changes it) AND the full query-parameter set (different filters get
+   *     different validators, so a cache can never satisfy one filter with
+   *     another's body), and
+   *   - Last-Modified (from the catalog store's write timestamp) when available.
+   *
+   * If-None-Match is honoured with an empty 304 BEFORE the expensive work runs,
+   * so a polling client that already holds the data never re-embeds the query
+   * or re-scores the catalog.
+   */
+  function applyDiscoveryCache(req, reply, catalog, params) {
+    const policy = config.discoveryCache ?? { maxAgeSeconds: 60, staleWhileRevalidateSeconds: 300 };
+    const cc = `public, max-age=${policy.maxAgeSeconds}, stale-while-revalidate=${policy.staleWhileRevalidateSeconds}`;
+    reply.header('cache-control', cc);
+
+    const version = typeof catalog.getVersion === 'function' ? catalog.getVersion() : 0;
+    const etag = discoveryETag(version, params);
+    reply.header('etag', etag);
+
+    if (typeof catalog.getLastModified === 'function') {
+      const lm = catalog.getLastModified();
+      if (lm) reply.header('last-modified', new Date(lm).toUTCString());
+    }
+
+    const inm = req.headers['if-none-match'];
+    const notModified = inm
+      ? inm
+          .split(',')
+          .map(s => s.trim())
+          .includes(etag)
+      : false;
+    return { etag, notModified };
+  }
+
+  /**
    * GET /discovery/resources — public catalog read.
    *
    * Public reads are intentional: a discovery catalog that agents cannot browse
@@ -1399,6 +1474,12 @@ export async function createApp(
       limit: clampedLimit,
       offset: clampedOffset,
     };
+
+    // #200: validators are computed and matched BEFORE the expensive work, so
+    // a polling client that already holds this representation gets an empty
+    // 304 instead of a re-run of the listing path.
+    const cache = applyDiscoveryCache(req, reply, catalog, params);
+    if (cache.notModified) return reply.code(304).send();
 
     try {
       const result = await catalog.listResources(params);
@@ -1462,6 +1543,11 @@ export async function createApp(
       cursor: req.query.cursor,
     };
 
+    // #200: same contract as the listing route — validators before the
+    // expensive work (here: embedding the query and scoring the catalog).
+    const cache = applyDiscoveryCache(req, reply, catalog, params);
+    if (cache.notModified) return reply.code(304).send();
+
     try {
       const result = await catalog.search(params);
       await rateLimiter.recordCatalogRead(req);
@@ -1478,6 +1564,22 @@ export async function createApp(
       return reply.code(500).send({ error: 'internal_error', reason: 'internal_error' });
     }
   });
+
+  /**
+   * DLQ operator API (view/replay/discard poisoned webhook messages).
+   * Registered only when a DeadLetterStore is available (DATABASE_URL set).
+   */
+  if (dlq) {
+    registerDlqRoutes(app, {
+      dlq: dlq.store,
+      publish: dlq.publish,
+      requireApiKeyStrict,
+      cors,
+      preflight,
+      audit,
+      retryOptions: dlq.retryOptions,
+    });
+  }
 
   /**
    * Preflight routes (#76).
