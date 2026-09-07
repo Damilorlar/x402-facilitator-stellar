@@ -47,42 +47,11 @@ import { lockKeyFor } from './distributed-lock.js';
 import { requestState } from './request-state.js';
 import { signerMetrics } from './metrics.js';
 import { buildSettlementStore } from './store/index.js';
-
 import { trace, context, propagation, SpanStatusCode } from '@opentelemetry/api';
 import { tracer } from './tracing.js';
 
 /** 256kb body cap, carried over unchanged from the Express transport. */
 const BODY_LIMIT_BYTES = 256 * 1024;
-
-/**
- * Stable, dependency-free serialization of the params that shape a discovery
- * response, so the ETag is stable across request encodings of the same filter.
- * Keys are sorted, arrays are sorted, and undefined/null are dropped.
- */
-function canonicalizeDiscoveryParams(params) {
-  const out = {};
-  for (const key of Object.keys(params || {}).sort()) {
-    const v = params[key];
-    if (v === undefined || v === null) continue;
-    out[key] = Array.isArray(v) ? v.slice().sort() : String(v);
-  }
-  return JSON.stringify(out);
-}
-
-/**
- * Weak ETag for a discovery response (#200). Keyed on BOTH the monotonic
- * catalog version (any write changes it, so it invalidates every cached
- * variant at once) AND the full parameter set (different filters are different
- * representations and must never share a validator).
- */
-function discoveryETag(catalogVersion, params) {
-  const hash = crypto
-    .createHash('sha1')
-    .update(canonicalizeDiscoveryParams(params))
-    .digest('base64url')
-    .replace(/=+$/, '');
-  return `W/"${catalogVersion}-${hash}"`;
-}
 
 /**
  * AJV schema for both payment routes. Deliberately loose: it asserts only the
@@ -209,9 +178,6 @@ export async function createApp(
     webhooks = null,
     failoverHealth = null,
     settlementStore = extras.settlementStore ?? buildSettlementStore(config),
-    // DLQ operator API (#DLQ): { store: DeadLetterStore, publish, retryOptions }.
-    // Absent (no DATABASE_URL) means the routes are simply not registered.
-    dlq = null,
   } = extras;
 
   // Observability collaborators. Both are injectable so tests can capture the
@@ -487,7 +453,7 @@ export async function createApp(
     };
   }
 
-  function preflight(policy, methods) {
+  function preflight(policy) {
     return async (req, reply) => {
       cors(policy)(req, reply);
       // Answer the preflight even when the origin is not granted: the 204
@@ -495,7 +461,7 @@ export async function createApp(
       // which is the enforcement point, not the preflight status.
       reply.header(
         'Access-Control-Allow-Methods',
-        methods ?? (policy === 'public' ? 'GET, OPTIONS' : 'POST, OPTIONS'),
+        policy === 'public' ? 'GET, OPTIONS' : 'POST, OPTIONS',
       );
       reply.header('Access-Control-Allow-Headers', 'Authorization, Content-Type');
       reply.header('Access-Control-Max-Age', '600');
@@ -875,68 +841,21 @@ export async function createApp(
     },
     async (req, reply) => {
       return withRequestSpan(`HTTP ${req.method} /verify`, req, async () => {
-        const checkVerify = await rateLimiter.checkVerify(req);
-        if (!checkVerify.allowed) return rejectRateLimited(req, reply, '/verify', checkVerify);
-
-      const check = await rateLimiter.checkVerify(req);
-      if (!check.allowed) return rejectRateLimited(req, reply, '/verify', check);
-
-      const body = readPaymentBody(req, reply);
-      if (!body) return reply;
-      if (req.span) {
-        req.span.network = body.paymentRequirements.network;
-        req.span.scheme = body.paymentRequirements.scheme;
-      }
-      try {
-        const recorded = await rateLimiter.recordVerify(req);
-        applyRateLimitHead(reply, recorded, check);
-        const timeoutMs = config.requestTimeoutMs ?? 30_000;
-        let timeoutTimer;
-        const timeoutPromise = new Promise((_, reject) => {
-          timeoutTimer = setTimeout(() => {
-            const err = new Error('request timeout');
-            err.code = 'REQUEST_TIMEOUT';
-            reject(err);
-          }, timeoutMs);
-        });
-
-        metrics.incActiveVerifications();
-        let result;
-        try {
-          const verifyPromise = facilitator.verify(body.paymentPayload, body.paymentRequirements);
-          result = await Promise.race([verifyPromise, timeoutPromise]).finally(() => {
-            clearTimeout(timeoutTimer);
-          });
-        } finally {
-          metrics.decActiveVerifications();
-        }
-
+        const check = await rateLimiter.checkVerify(req);
+        if (!check.allowed) return rejectRateLimited(req, reply, '/verify', check);
 
         const body = readPaymentBody(req, reply);
         if (!body) return reply;
+        
         if (req.span) {
-
           req.span.network = body.paymentRequirements.network;
           req.span.scheme = body.paymentRequirements.scheme;
-
-          req.span.outcome = result.isValid ? 'ok' : 'rejected';
-          req.span.reason = result.isValid ? 'none' : (result.invalidReason ?? 'invalid');
         }
-        audit('verification', {
-          actor: req.keyId ?? `ip:${req.ip}`,
-          outcome: result.isValid ? 'valid' : 'invalid',
-          invalid_reason: result.invalidReason ?? null,
-          network: body.paymentRequirements.network,
-        });
-        if (result.isValid) {
-          // A verify moves no money, so the listing it creates is provisional
-          // and expires unless a settlement promotes it (#140).
-          await processCataloging(req, body, reply, 'verify');
 
-        }
         try {
-          await rateLimiter.recordVerify(req);
-          handleRateLimit(reply, checkVerify);
+          const recorded = await rateLimiter.recordVerify(req);
+          applyRateLimitHead(reply, recorded, check);
+          
           const timeoutMs = config.requestTimeoutMs ?? 30_000;
           let timeoutTimer;
           const timeoutPromise = new Promise((_, reject) => {
@@ -947,43 +866,40 @@ export async function createApp(
             }, timeoutMs);
           });
 
-          const verifyPromise = tracedSchemeCall(
-            'verify',
-            body.paymentRequirements.network,
-            () => facilitator.verify(body.paymentPayload, body.paymentRequirements),
-            { 'tenant.id': req.keyId ?? 'open' },
-          );
-          const result = await Promise.race([verifyPromise, timeoutPromise]).finally(() => {
-            clearTimeout(timeoutTimer);
-          });
+          metrics.incActiveVerifications();
+          let result;
+          try {
+            const verifyPromise = tracedSchemeCall(
+              'verify',
+              body.paymentRequirements.network,
+              () => facilitator.verify(body.paymentPayload, body.paymentRequirements),
+              { 'tenant.id': req.keyId ?? 'open' },
+            );
+            result = await Promise.race([verifyPromise, timeoutPromise]).finally(() => {
+              clearTimeout(timeoutTimer);
+            });
+          } finally {
+            metrics.decActiveVerifications();
+          }
 
           if (req.span) {
             req.span.outcome = result.isValid ? 'ok' : 'rejected';
             req.span.reason = result.isValid ? 'none' : (result.invalidReason ?? 'invalid');
           }
+
           audit('verification', {
             actor: req.keyId ?? `ip:${req.ip}`,
             outcome: result.isValid ? 'valid' : 'invalid',
             invalid_reason: result.invalidReason ?? null,
             network: body.paymentRequirements.network,
           });
+          
           if (result.isValid) {
-            await processCataloging(req, body, reply, 'payment');
+            await processCataloging(req, body, reply, 'verify');
           }
+          
           return reply.send(result);
         } catch (err) {
-          // An exception must not become a 500 with an empty body: to a client that
-          // is indistinguishable from the service being down, and it carries no
-          // reason code. Shape it like a verification failure instead.
-          //
-          // Note ExactStellarScheme already absorbs its own internal exceptions and
-          // returns invalidReason "unexpected_verify_error" rather than throwing, so
-          // this path only catches failures above the scheme — an unregistered
-          // scheme/network pair, for instance. A distinct code keeps the two
-          // distinguishable to a client.
-          //
-          // An open RPC breaker gets its own code so a caller can tell "the chain
-          // is unreachable" from "your payment was rejected" (#105, #6).
           const network = body?.paymentRequirements?.network ?? 'unknown';
           const scheme = body?.paymentRequirements?.scheme ?? 'unknown';
           console.error(
@@ -1000,10 +916,12 @@ export async function createApp(
           } else if (err?.message?.includes('unregistered')) {
             invalidReason = 'unsupported_scheme_network';
           }
+          
           if (req.span) {
             req.span.outcome = 'error';
             req.span.reason = invalidReason;
           }
+          
           if (invalidReason !== 'facilitator_error') {
             audit('rpc_unreachable', {
               actor: req.keyId ?? `ip:${req.ip}`,
@@ -1011,6 +929,7 @@ export async function createApp(
               reason: invalidReason,
             });
           }
+          
           return reply.send({
             isValid: false,
             invalidReason,
@@ -1018,10 +937,6 @@ export async function createApp(
           });
         }
       });
-    },
-  );
-
-  app.post(
     '/settle',
     {
       onRequest: cors('authenticated'),
@@ -1030,7 +945,6 @@ export async function createApp(
       attachValidation: true,
     },
     async (req, reply) => {
-
       return withRequestSpan(`HTTP ${req.method} /settle`, req, async () => {
         const body = readPaymentBody(req, reply, 'settle');
         if (!body) return reply;
@@ -1039,78 +953,6 @@ export async function createApp(
         if (req.span) {
           req.span.network = network;
           req.span.scheme = body.paymentRequirements.scheme;
-
-      const body = readPaymentBody(req, reply, 'settle');
-      if (!body) return reply;
-      const network = body.paymentRequirements.network;
-      const signer = signers[network] ?? null;
-      if (req.span) {
-        req.span.network = network;
-        req.span.scheme = body.paymentRequirements.scheme;
-      }
-
-      const check = await rateLimiter.checkSettle(req, network);
-      if (!check.allowed) return rejectRateLimited(req, reply, '/settle', check);
-
-      /**
-       * Degraded-mode gate (#10, #19): if a durable settlement record store was
-       * expected but is currently down, refuse to settle rather than risk
-       * settling with no durable record (which would defeat idempotency/audit on
-       * retry). `/verify` stays up. The in-memory default (`DATABASE_URL` unset)
-       * is never "degraded", so open testnet is unaffected.
-       */
-      if (
-        config.requireDurableSettlementStore &&
-        config.databaseUrl &&
-        settlementStore.degraded === true
-      ) {
-        audit('settlement_refused', {
-          actor: req.keyId ?? `ip:${req.ip}`,
-          reason: 'settlement_store_unavailable',
-          network: body.paymentRequirements.network,
-        });
-        handleRateLimit(reply, check);
-        return reply.code(503).send({
-          success: false,
-          errorReason: 'settlement_store_unavailable',
-          errorMessage:
-            'Settlement record store is unavailable; refusing to settle without a durable record. Retry once the store recovers.',
-          transaction: '',
-          network: body.paymentRequirements.network,
-        });
-      }
-
-      const idempotencyKey = settlementStore.deriveIdempotencyKey(req);
-      const existingRecord = await settlementStore.get(idempotencyKey);
-
-      if (existingRecord) {
-        if (existingRecord.state === 'settled') {
-          handleRateLimit(reply, check);
-          if (existingRecord.response) {
-            const respPayload =
-              typeof existingRecord.response === 'string'
-                ? JSON.parse(existingRecord.response)
-                : existingRecord.response;
-            return reply.send(respPayload);
-          }
-          return reply.send({
-            success: true,
-            transaction: existingRecord.tx_hash,
-            network: existingRecord.network,
-            payer: existingRecord.payer,
-          });
-        }
-        if (existingRecord.state === 'submitted' || existingRecord.state === 'unknown') {
-          handleRateLimit(reply, check);
-          return reply.send({
-            success: false,
-            errorReason: 'submitted_outcome_unknown',
-            errorMessage:
-              existingRecord.error_message || 'settlement in progress or outcome unknown',
-            transaction: existingRecord.tx_hash || '',
-            network: existingRecord.network,
-          });
-
         }
 
         const checkSettle = await rateLimiter.checkSettle(req, network);
@@ -1584,48 +1426,17 @@ handleRateLimit(reply, checkSettle);
   );
 
   /**
-   * Discovery caching (#200).
+   * GET /discovery/resources — public catalog read.
    *
-   * GET /discovery/resources and /discovery/search are the read-heavy half of
-   * the service and the half most likely to be polled, yet they carried no
-   * cache headers — so every agent query re-ran the ranking/embedding path over
-   * data the client already held. Both routes now emit:
+   * Public reads are intentional: a discovery catalog that agents cannot browse
+   * is not much of a catalog. The endpoint is unauthenticated but rate-limited
+   * to prevent abuse. Reads use a separate bucket from writes (catalogReadRpm)
+   * because they have very different cost profiles.
    *
-   *   - Cache-Control: configurable `public, max-age=…, stale-while-revalidate=…`
-   *   - a weak ETag derived from BOTH the monotonic catalog version (any write
-   *     changes it) AND the full query-parameter set (different filters get
-   *     different validators, so a cache can never satisfy one filter with
-   *     another's body), and
-   *   - Last-Modified (from the catalog store's write timestamp) when available.
-   *
-   * If-None-Match is honoured with an empty 304 BEFORE the expensive work runs,
-   * so a polling client that already holds the data never re-embeds the query
-   * or re-scores the catalog.
+   * Pagination is clamped at the API boundary before passing to the catalog.
+   * The catalog may assume validated input; duplicated defensive clamping in
+   * the catalog implementation is acceptable if documented.
    */
-  function applyDiscoveryCache(req, reply, catalog, params) {
-    const policy = config.discoveryCache ?? { maxAgeSeconds: 60, staleWhileRevalidateSeconds: 300 };
-    const cc = `public, max-age=${policy.maxAgeSeconds}, stale-while-revalidate=${policy.staleWhileRevalidateSeconds}`;
-    reply.header('cache-control', cc);
-
-    const version = typeof catalog.getVersion === 'function' ? catalog.getVersion() : 0;
-    const etag = discoveryETag(version, params);
-    reply.header('etag', etag);
-
-    if (typeof catalog.getLastModified === 'function') {
-      const lm = catalog.getLastModified();
-      if (lm) reply.header('last-modified', new Date(lm).toUTCString());
-    }
-
-    const inm = req.headers['if-none-match'];
-    const notModified = inm
-      ? inm
-          .split(',')
-          .map(s => s.trim())
-          .includes(etag)
-      : false;
-    return { etag, notModified };
-  }
-
   app.get('/discovery/resources', { onRequest: cors('public') }, async (req, reply) => {
     annotateSpan({ 'tenant.id': req.keyId ?? 'open', 'http.route': '/discovery/resources' });
     const checkCatalogRead = await rateLimiter.checkCatalogRead(req);
@@ -1656,12 +1467,6 @@ handleRateLimit(reply, checkSettle);
       limit: clampedLimit,
       offset: clampedOffset,
     };
-
-    // #200: validators are computed and matched BEFORE the expensive work, so
-    // a polling client that already holds this representation gets an empty
-    // 304 instead of a re-run of the listing path.
-    const cache = applyDiscoveryCache(req, reply, catalog, params);
-    if (cache.notModified) return reply.code(304).send();
 
     try {
       const result = await catalog.listResources(params);
@@ -1724,11 +1529,6 @@ handleRateLimit(reply, checkSettle);
       cursor: req.query.cursor,
     };
 
-    // #200: same contract as the listing route — validators before the
-    // expensive work (here: embedding the query and scoring the catalog).
-    const cache = applyDiscoveryCache(req, reply, catalog, params);
-    if (cache.notModified) return reply.code(304).send();
-
     try {
       const result = await catalog.search(params);
       await rateLimiter.recordCatalogRead(req);
@@ -1745,22 +1545,6 @@ handleRateLimit(reply, checkSettle);
       return reply.code(500).send({ error: 'internal_error', reason: 'internal_error' });
     }
   });
-
-  /**
-   * DLQ operator API (view/replay/discard poisoned webhook messages).
-   * Registered only when a DeadLetterStore is available (DATABASE_URL set).
-   */
-  if (dlq) {
-    registerDlqRoutes(app, {
-      dlq: dlq.store,
-      publish: dlq.publish,
-      requireApiKeyStrict,
-      cors,
-      preflight,
-      audit,
-      retryOptions: dlq.retryOptions,
-    });
-  }
 
   /**
    * Preflight routes (#76).
