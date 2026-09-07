@@ -846,7 +846,7 @@ export async function createApp(
 
         const body = readPaymentBody(req, reply);
         if (!body) return reply;
-        
+
         if (req.span) {
           req.span.network = body.paymentRequirements.network;
           req.span.scheme = body.paymentRequirements.scheme;
@@ -855,7 +855,7 @@ export async function createApp(
         try {
           const recorded = await rateLimiter.recordVerify(req);
           applyRateLimitHead(reply, recorded, check);
-          
+
           const timeoutMs = config.requestTimeoutMs ?? 30_000;
           let timeoutTimer;
           const timeoutPromise = new Promise((_, reject) => {
@@ -893,11 +893,11 @@ export async function createApp(
             invalid_reason: result.invalidReason ?? null,
             network: body.paymentRequirements.network,
           });
-          
+
           if (result.isValid) {
             await processCataloging(req, body, reply, 'verify');
           }
-          
+
           return reply.send(result);
         } catch (err) {
           const network = body?.paymentRequirements?.network ?? 'unknown';
@@ -916,12 +916,12 @@ export async function createApp(
           } else if (err?.message?.includes('unregistered')) {
             invalidReason = 'unsupported_scheme_network';
           }
-          
+
           if (req.span) {
             req.span.outcome = 'error';
             req.span.reason = invalidReason;
           }
-          
+
           if (invalidReason !== 'facilitator_error') {
             audit('rpc_unreachable', {
               actor: req.keyId ?? `ip:${req.ip}`,
@@ -929,7 +929,7 @@ export async function createApp(
               reason: invalidReason,
             });
           }
-          
+
           return reply.send({
             isValid: false,
             invalidReason,
@@ -1066,7 +1066,7 @@ export async function createApp(
                 () => facilitator.settle(body.paymentPayload, body.paymentRequirements),
                 { 'tenant.id': req.keyId ?? 'open' },
               );
-              
+
               const sponsoredFee = result.success
                 ? (config.perNetwork?.[network]?.maxTransactionFeeStroops ?? 50000)
                 : 0;
@@ -1081,9 +1081,9 @@ export async function createApp(
                 req.span.txHash = result.transaction || null;
                 req.span.feeStroops = actualFee;
               }
-              
+
               applyRateLimitHead(reply, recorded, checkSettle);
-              
+
               if (result.success) {
                 const event = webhooks
                   ? {
@@ -1325,7 +1325,8 @@ export async function createApp(
       if (!body) return reply;
 
       const checkCatalog = await rateLimiter.checkCatalog(req);
-      if (!checkCatalog.allowed) return rejectRateLimited(req, reply, '/discovery/resources', checkCatalog);
+      if (!checkCatalog.allowed)
+        return rejectRateLimited(req, reply, '/discovery/resources', checkCatalog);
 
       const validation = validateForCatalog(body.paymentPayload, body.paymentRequirements);
       if (validation.hardDrop) {
@@ -1370,7 +1371,8 @@ export async function createApp(
   app.get('/discovery/resources', { onRequest: cors('public') }, async (req, reply) => {
     annotateSpan({ 'tenant.id': req.keyId ?? 'open', 'http.route': '/discovery/resources' });
     const checkCatalogRead = await rateLimiter.checkCatalogRead(req);
-    if (!checkCatalogRead.allowed) return rejectRateLimited(req, reply, '/discovery/resources', checkCatalogRead);
+    if (!checkCatalogRead.allowed)
+      return rejectRateLimited(req, reply, '/discovery/resources', checkCatalogRead);
 
     let extensions;
     if (req.query.extensions) {
@@ -1430,7 +1432,8 @@ export async function createApp(
   app.get('/discovery/search', { onRequest: cors('public') }, async (req, reply) => {
     annotateSpan({ 'tenant.id': req.keyId ?? 'open', 'http.route': '/discovery/search' });
     const checkCatalogRead = await rateLimiter.checkCatalogRead(req);
-    if (!checkCatalogRead.allowed) return rejectRateLimited(req, reply, '/discovery/search', checkCatalogRead);
+    if (!checkCatalogRead.allowed)
+      return rejectRateLimited(req, reply, '/discovery/search', checkCatalogRead);
 
     if (!req.query.query) {
       return reply.code(400).send({ error: 'invalid_request', reason: 'query is required' });
