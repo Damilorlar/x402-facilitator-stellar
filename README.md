@@ -114,6 +114,12 @@ curl localhost:3402/readyz
 
 `FACILITATOR_SECRET` is a signing key. `.env` is gitignored — never commit it.
 
+The two standalone CLIs — the agent-facing `x402-mcp` MCP server and the
+seller-facing `validate-discovery` tool — ship on npm as
+[`@accensa/x402-facilitator-stellar`](https://www.npmjs.com/package/@accensa/x402-facilitator-stellar)
+(`npm install -g @accensa/x402-facilitator-stellar` then `x402-mcp`; see
+[`docs/MCP.md`](docs/MCP.md)). The facilitator service itself runs from this
+checkout, as above.
 ### Testnet Setup
 
 Payments on Stellar need funded accounts, and USDC-priced payments additionally need
@@ -226,8 +232,10 @@ Summary (full detail and evidence in the report):
 - ⬜ `stellar:pubnet` and the pubnet half of the upstream suite — blocked on
   [#17](https://github.com/accensa/x402-facilitator-stellar/issues/17).
 - ❌ Bazaar listing rejected by a third-party client (`invalid_routeTemplate`,
-  [#65](https://github.com/accensa/x402-facilitator-stellar/issues/65)); `__check_auth`
-  smart-account payer untested ([#13](https://github.com/accensa/x402-facilitator-stellar/issues/13)).
+  [#65](https://github.com/accensa/x402-facilitator-stellar/issues/65)).
+- ✅ **A `__check_auth` smart-account payer works end to end** — a deployed Soroban
+  account contract as payer, spend cap enforced: in-cap settles, over-cap is rejected
+  with a non-null reason ([#13](https://github.com/accensa/x402-facilitator-stellar/issues/13)).
 
 The README is the summary; the report is the artifact. Trust the links, not this paragraph.
 
@@ -242,6 +250,10 @@ holds today on testnet:
 - [x] **Settled transaction hash published** — see the conformance table below
 - [x] **The x402 repository's e2e suite — 5 of 5 server components pass** (10/10
       scenarios across `express`, `fastify`, `hono`, `next`, `mcp`, 2026-08-25/26)
+- [x] **`__check_auth` smart-account payer works end to end** — contract account as
+      payer (fixture in `test/fixtures/smart-account/`), spend-cap variant exercised:
+      payment under the cap settles, over it is rejected with a non-null reason
+      (2026-09-03, [#13](https://github.com/accensa/x402-facilitator-stellar/issues/13))
 - [ ] `stellar:pubnet` (code-path verified; on-mainnet proof pending funded keys [#17])
 
 ### Settled on Stellar testnet, 2026-08-14
@@ -287,6 +299,27 @@ Responses use the canonical field names — `VerifyResponse` carries `invalidRea
 `invalidMessage`; `SettleResponse` carries `errorReason`, `errorMessage`, `transaction`
 and `network`. The transport-layer HTTP rejections (such as 401 Unauthorized or 429 Too Many Requests) also conform to the `VerifyResponse` shape to ensure a client has one parser, not three. For an exhaustive taxonomy of all emitted reasons, see [REASONS.md](docs/REASONS.md).
 
+### `__check_auth` smart-account payer works end to end — 2026-09-03
+
+`scripts/e2e.mjs` proves one payer shape: a classic ed25519 keypair. This run
+(`npm run e2e:smart-account`) proves the other — a **custom Soroban account
+contract** implementing `__check_auth`, the shape agent wallets take when they
+carry a spending policy. The fixture (contract source + build steps + vendored
+wasm) lives in [`test/fixtures/smart-account/`](test/fixtures/smart-account/);
+three deployed instances act as payer: no cap, cap 1,000,000 stroops, cap 500
+stroops, paying a 1,000-stroop price on XLM testnet.
+
+| Transaction | Outcome |
+|---|---|
+| [`6ba91c91…f5ee3`](https://stellar.expert/explorer/testnet/tx/6ba91c91efce72f3db1ddb0537df80a3579657f33bf5843c802d85fccf5f5ee3) | no-cap payer: **settled** |
+| [`f5b5b8f3…fe88`](https://stellar.expert/explorer/testnet/tx/f5b5b8f31453ec3dff90c5d4fc860d2a828c3f306750fb2c1d372617b3cafe88) | in-cap payer: **settled** |
+| — | over-cap payer: rejected with `invalid_exact_stellar_payload_simulation_failed` (host shows the contract's `SpendCapExceeded`) |
+
+The auth entry of a contract-account payer and a classic keypair payer — and why
+the identical-looking credential is the silent-regression risk #13 was opened
+for — plus the one documented client-side glue deviation, are in
+[`docs/CONFORMANCE.md`](docs/CONFORMANCE.md).
+
 ## Known Gaps
 
 - **Bazaar is built but unproven against a second implementation.** Discovery, search and
@@ -328,6 +361,10 @@ and `network`. The transport-layer HTTP rejections (such as 401 Unauthorized or 
 
 Issues and pull requests welcome. Given the status above, the most useful contribution is
 a conformance failure: point a canonical client at it and report what breaks.
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first — it covers the Node version to
+develop against, the full local check sequence, the dependency licence policy,
+and how to run conformance against a branch.
 
 ## Contributors
 

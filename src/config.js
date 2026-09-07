@@ -26,6 +26,19 @@ function vaultUrlHasUserinfo(url) {
  * signer secret, because the failure mode of accidentally running a mainnet
  * facilitator with a testnet-shaped config is losing real money.
  */
+/**
+ * Parse a positive integer from an env var, with a default and optional bounds
+ * check. Rejects NaN, negatives, and values above max. (#175)
+ */
+function parsePositiveInt(value, { name, defaultValue, min = 1, max = Number.MAX_SAFE_INTEGER }) {
+  const raw = value ?? String(defaultValue);
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min || n > max) {
+    throw new Error(`${name} must be a finite integer between ${min} and ${max}, got "${raw}".`);
+  }
+  return n;
+}
+
 function parseSecrets(env, pluralKey, singularKey) {
   const raw = env[pluralKey] ?? env[singularKey];
   if (!raw) {
@@ -65,6 +78,18 @@ function parseOptionalSecret(env, key) {
   return raw;
 }
 
+/**
+ * Non-negative integer from an env var, falling back to `fallback` when unset,
+ * unparsable, or negative (#200). Garbage config must not poison a
+ * Cache-Control header — it falls back to the documented default instead.
+ */
+function nonNegativeInt(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.floor(n);
+}
+
 export function resolveConfig(env = process.env) {
   const testnetSecrets = parseSecrets(env, 'FACILITATOR_SECRETS', 'FACILITATOR_SECRET');
   const testnetFeeBumpSecret = parseOptionalSecret(env, 'FEE_BUMP_SECRET');
@@ -76,7 +101,12 @@ export function resolveConfig(env = process.env) {
       secret: testnetSecrets[0],
       feeBumpSecret: testnetFeeBumpSecret,
       rpcUrl: env.STELLAR_RPC_URL,
-      maxTransactionFeeStroops: Number(env.MAX_TX_FEE_STROOPS ?? 50_000),
+      maxTransactionFeeStroops: parsePositiveInt(env.MAX_TX_FEE_STROOPS, {
+        name: 'MAX_TX_FEE_STROOPS',
+        defaultValue: 50_000,
+        min: 100,
+        max: 10_000_000,
+      }),
       keyManagerUrl: env.KEY_MANAGER_URL || null,
       keyManagerPollIntervalMs: Number(env.KEY_MANAGER_POLL_INTERVAL_MS ?? 0),
     },
@@ -170,7 +200,12 @@ export function resolveConfig(env = process.env) {
       secret: pubnetSecrets[0],
       feeBumpSecret: pubnetFeeBumpSecret,
       rpcUrl: env.STELLAR_RPC_URL_PUBNET,
-      maxTransactionFeeStroops: Number(env.MAX_TX_FEE_STROOPS_PUBNET ?? 50_000),
+      maxTransactionFeeStroops: parsePositiveInt(env.MAX_TX_FEE_STROOPS_PUBNET, {
+        name: 'MAX_TX_FEE_STROOPS_PUBNET',
+        defaultValue: 50_000,
+        min: 100,
+        max: 10_000_000,
+      }),
       keyManagerUrl: env.KEY_MANAGER_URL_PUBNET || null,
       keyManagerPollIntervalMs: Number(
         env.KEY_MANAGER_POLL_INTERVAL_MS_PUBNET ?? env.KEY_MANAGER_POLL_INTERVAL_MS ?? 0,
@@ -224,7 +259,7 @@ export function resolveConfig(env = process.env) {
     .filter(Boolean);
 
   return {
-    port: Number(env.PORT ?? 3402),
+    port: parsePositiveInt(env.PORT, { name: 'PORT', defaultValue: 3402, min: 1, max: 65535 }),
 
     /**
      * Diagnostic log verbosity. Parsed leniently by src/log.js — an unknown
@@ -410,6 +445,23 @@ export function resolveConfig(env = process.env) {
      */
     catalogVerifyTtlMs: Number(env.CATALOG_VERIFY_TTL_MS ?? 24 * 60 * 60 * 1000),
     enableReranking: env.ENABLE_RERANKING === 'true',
+
+    /**
+     * Discovery caching (#200). Applied to GET /discovery/resources and
+     * GET /discovery/search: the Cache-Control max-age and the
+     * stale-while-revalidate window. Values belong in config, not hardcoded —
+     * an operator running a fast-moving catalog wants something different from
+     * one running a static demo. Defaults: 60s max-age, 300s
+     * stale-while-revalidate. max-age=0 disables client-side caching entirely
+     * (the ETag/304 revalidation still works — it just requires a round trip).
+     * Garbage or negative values fall back to the defaults rather than
+     * poisoning the Cache-Control header.
+     */
+    discoveryCache: {
+      maxAgeSeconds: nonNegativeInt(env.DISCOVERY_CACHE_MAX_AGE_SECONDS, 60),
+      staleWhileRevalidateSeconds: nonNegativeInt(env.DISCOVERY_CACHE_STALE_SECONDS, 300),
+    },
+
     shutdownGraceMs: Number(env.SHUTDOWN_GRACE_MS ?? 15_000),
     requestTimeoutMs: Number(env.REQUEST_TIMEOUT_MS ?? 30_000),
 
