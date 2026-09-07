@@ -106,7 +106,7 @@ test('W3C trace context propagates and spans carry metadata', { timeout: 30000 }
     OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${collector.address().port}`,
   });
 
-  const app = createApp(config, facilitator, rateLimiter, catalog, null, {});
+  const app = await createApp(config, facilitator, rateLimiter, catalog, null, {});
   await app.listen({ port: 0 });
   const { port } = app.server.address();
   const url = `http://127.0.0.1:${port}/settle`;
@@ -132,7 +132,7 @@ test('W3C trace context propagates and spans carry metadata', { timeout: 30000 }
     propagation.inject(context.active(), headers);
     const body = await postJson(url, payload, headers);
     assert.equal(body.transaction, 'tx_deadbeef');
-    return { traceId: sc.traceId, spanId: sc.spanId };
+    clientSpan.end(); return { traceId: sc.traceId, spanId: sc.spanId };
   });
 
   await app.close();
